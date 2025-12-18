@@ -1,6 +1,8 @@
 import os
+import re
 import json
 import time
+import math
 import textwrap
 import datetime as dt
 from dataclasses import dataclass
@@ -8,6 +10,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 import streamlit as st
+import pandas as pd
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -15,12 +18,92 @@ from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+import hashlib
+import hmac
+import time
+import streamlit as st
 
-# =========================
-# App Config
-# =========================
+def _get_allowed_passwords():
+    # Prefer list, fall back to single
+    pw_list = st.secrets.get("ADMIN_PASSWORDS", None)
+    if pw_list and isinstance(pw_list, (list, tuple)) and len(pw_list) > 0:
+        return [str(x) for x in pw_list]
+    single = st.secrets.get("ADMIN_PASSWORD", "")
+    return [str(single)] if single else []
+
+def _secure_compare(a: str, b: str) -> bool:
+    # constant-time compare
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+def require_login():
+    """
+    Returns True if authenticated; otherwise renders login page and stops app.
+    """
+    if "auth_ok" not in st.session_state:
+        st.session_state.auth_ok = False
+    if "auth_tries" not in st.session_state:
+        st.session_state.auth_tries = 0
+    if "auth_locked_until" not in st.session_state:
+        st.session_state.auth_locked_until = 0.0
+
+    # already logged in
+    if st.session_state.auth_ok:
+        return True
+
+    # lockout
+    now = time.time()
+    if now < st.session_state.auth_locked_until:
+        wait_s = int(st.session_state.auth_locked_until - now)
+        st.error(f"尝试次数过多，请 {wait_s}s 后再试。")
+        st.stop()
+
+    allowed = _get_allowed_passwords()
+    if not allowed:
+        st.error("未配置管理员密码：请在 .streamlit/secrets.toml 设置 ADMIN_PASSWORD 或 ADMIN_PASSWORDS。")
+        st.stop()
+
+    # --- Login UI ---
+    st.set_page_config(page_title="AuraInsight 登录", layout="centered")
+    st.markdown("## AuraInsight 工具登录")
+    st.caption("请输入管理员设置的密码后进入。")
+
+    pw = st.text_input("密码", type="password")
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        if st.button("登录", type="primary"):
+            ok = any(_secure_compare(pw, x) for x in allowed)
+            if ok:
+                st.session_state.auth_ok = True
+                st.session_state.auth_tries = 0
+                st.success("登录成功。")
+                st.rerun()
+            else:
+                st.session_state.auth_tries += 1
+                st.error("密码错误。")
+
+                # lockout policy: 5 tries -> lock 60s
+                if st.session_state.auth_tries >= 5:
+                    st.session_state.auth_locked_until = time.time() + 60
+                    st.session_state.auth_tries = 0
+                    st.warning("已暂时锁定 60 秒。")
+
+    with col2:
+        st.button("清空", on_click=lambda: None)
+
+    st.stop()
+
+def logout_button():
+    if st.button("登出"):
+        st.session_state.auth_ok = False
+        st.session_state.auth_locked_until = 0.0
+        st.session_state.auth_tries = 0
+        st.rerun()
+
+# ======================================
+# Config
+# ======================================
 APP_TITLE = "AuraInsight 报告生成器（Trade Area & Growth Diagnostic）"
-
 OUTPUT_DIR = "output"
 ASSETS_DIR = "assets"
 FONTS_DIR = os.path.join(ASSETS_DIR, "fonts")
@@ -28,20 +111,19 @@ FONTS_DIR = os.path.join(ASSETS_DIR, "fonts")
 BG_COVER_DEFAULT = os.path.join(ASSETS_DIR, "bg_cover.png")
 BG_CONTENT_DEFAULT = os.path.join(ASSETS_DIR, "bg_content.png")
 
-# Static fonts (your GitHub uploaded files)
+# Static fonts (as per your GitHub upload)
 FONT_NOTO_REG = os.path.join(FONTS_DIR, "NotoSansSC-Regular.ttf")
 FONT_NOTO_BOLD = os.path.join(FONTS_DIR, "NotoSansSC-Bold.ttf")
-
 FONT_ROBOTO_REG = os.path.join(FONTS_DIR, "Roboto-Regular.ttf")
 FONT_ROBOTO_BOLD = os.path.join(FONTS_DIR, "Roboto-Bold.ttf")
 FONT_ROBOTO_ITALIC = os.path.join(FONTS_DIR, "Roboto-Italic.ttf")
 
-PAGE_W, PAGE_H = letter  # 612x792 points
+PAGE_W, PAGE_H = letter  # 612x792
 
 
-# =========================
+# ======================================
 # Data Models
-# =========================
+# ======================================
 @dataclass
 class ReportInputs:
     report_date: str
@@ -50,23 +132,21 @@ class ReportInputs:
     address: str
     radius_miles: float
     platform_links: Dict[str, str]
-    competitor_names: List[str]
+    competitors: List[Dict[str, str]]
+    competitor_menu_notes: str
+    order_upload_meta: Dict[str, Any]
+    extra_business_context: str
 
 
-# =========================
+# ======================================
 # Fonts / Typography
-# =========================
+# ======================================
 def register_aurainsight_fonts():
-    """
-    Register production-safe static fonts.
-    Must be called once before any setFont usage with these names.
-    """
-    # Register only if file exists; otherwise fall back to Helvetica
+    # Register only if present (fallback to Helvetica if missing)
     if os.path.exists(FONT_NOTO_REG):
         pdfmetrics.registerFont(TTFont("Noto", FONT_NOTO_REG))
     if os.path.exists(FONT_NOTO_BOLD):
         pdfmetrics.registerFont(TTFont("Noto-Bold", FONT_NOTO_BOLD))
-
     if os.path.exists(FONT_ROBOTO_REG):
         pdfmetrics.registerFont(TTFont("Roboto", FONT_ROBOTO_REG))
     if os.path.exists(FONT_ROBOTO_BOLD):
@@ -93,9 +173,14 @@ def f_en(bold: bool = False, italic: bool = False) -> str:
     return "Helvetica-Bold" if bold else "Helvetica"
 
 
-# =========================
-# Google Places Helpers
-# =========================
+def is_ascii_line(s: str) -> bool:
+    s = s.strip()
+    return bool(s) and all(ord(ch) < 128 for ch in s)
+
+
+# ======================================
+# Google Places
+# ======================================
 def google_geocode(address: str, api_key: str) -> Optional[Tuple[float, float]]:
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     r = requests.get(url, params={"address": address, "key": api_key}, timeout=30)
@@ -110,29 +195,19 @@ def google_geocode(address: str, api_key: str) -> Optional[Tuple[float, float]]:
 def google_nearby_restaurants(lat: float, lng: float, api_key: str, radius_m: int = 1200) -> List[Dict[str, Any]]:
     url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
     results: List[Dict[str, Any]] = []
-
-    params = {
-        "location": f"{lat},{lng}",
-        "radius": radius_m,
-        "type": "restaurant",
-        "key": api_key
-    }
+    params = {"location": f"{lat},{lng}", "radius": radius_m, "type": "restaurant", "key": api_key}
 
     for _ in range(3):
         r = requests.get(url, params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
-
-        status = data.get("status")
-        if status not in ("OK", "ZERO_RESULTS"):
+        if data.get("status") not in ("OK", "ZERO_RESULTS"):
             break
-
         results.extend(data.get("results", []))
-
         token = data.get("next_page_token")
         if not token:
             break
-        time.sleep(2)  # required by Google
+        time.sleep(2)
         params = {"pagetoken": token, "key": api_key}
 
     return results
@@ -163,18 +238,125 @@ def google_textsearch_place_id(query: str, api_key: str) -> Optional[str]:
     return data["results"][0].get("place_id")
 
 
-# =========================
-# OpenAI Helper (Responses API)
-# =========================
-def openai_generate_report(prompt: str, api_key: str, model: str) -> str:
+# ======================================
+# Census ACS (Demographics)
+# ======================================
+def census_tract_from_latlng(lat: float, lng: float) -> Optional[Dict[str, str]]:
+    """
+    Uses US Census geocoder to find state/county/tract from coordinates.
+    No API key required.
+    """
+    url = "https://geocoding.geo.census.gov/geocoder/geographies/coordinates"
+    params = {
+        "x": lng,
+        "y": lat,
+        "benchmark": "Public_AR_Current",
+        "vintage": "Current_Current",
+        "format": "json"
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    try:
+        geos = data["result"]["geographies"]
+        tract = geos["Census Tracts"][0]
+        return {
+            "STATE": tract["STATE"],
+            "COUNTY": tract["COUNTY"],
+            "TRACT": tract["TRACT"],
+            "NAME": tract.get("NAME", "")
+        }
+    except Exception:
+        return None
+
+
+def acs_5y_profile(state: str, county: str, tract: str, year: int = 2023) -> Optional[Dict[str, Any]]:
+    """
+    Pull a small ACS 5-year profile for the tract.
+    """
+    # Core variables (tract level)
+    vars_map = {
+        "pop_total": "B01003_001E",
+        "median_income": "B19013_001E",
+        "median_age": "B01002_001E",
+        "white": "B02001_002E",
+        "black": "B02001_003E",
+        "asian": "B02001_005E",
+        "other": "B02001_007E",
+        "hispanic": "B03003_003E",
+        "housing_units": "B25001_001E",
+        "owner_occ": "B25003_002E",
+        "renter_occ": "B25003_003E",
+        "avg_hh_size": "B25010_001E",
+    }
+
+    get_vars = ",".join(["NAME"] + list(vars_map.values()))
+    url = f"https://api.census.gov/data/{year}/acs/acs5"
+    params = {
+        "get": get_vars,
+        "for": f"tract:{tract}",
+        "in": f"state:{state} county:{county}",
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+
+    # data[0] = headers, data[1] = values
+    if not data or len(data) < 2:
+        return None
+    headers = data[0]
+    values = data[1]
+    row = dict(zip(headers, values))
+
+    def to_num(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    out = {
+        "year": year,
+        "name": row.get("NAME", ""),
+        "state": state,
+        "county": county,
+        "tract": tract,
+    }
+    for k, v in vars_map.items():
+        out[k] = to_num(row.get(v))
+
+    # derived metrics
+    pop = out.get("pop_total") or 0
+    def pct(x):
+        if pop <= 0 or x is None:
+            return None
+        return x / pop
+
+    out["pct_asian"] = pct(out.get("asian"))
+    out["pct_white"] = pct(out.get("white"))
+    out["pct_black"] = pct(out.get("black"))
+    out["pct_hispanic"] = pct(out.get("hispanic"))
+
+    owner = out.get("owner_occ")
+    renter = out.get("renter_occ")
+    occ_total = (owner or 0) + (renter or 0)
+    if occ_total > 0:
+        out["pct_owner"] = (owner or 0) / occ_total
+        out["pct_renter"] = (renter or 0) / occ_total
+    else:
+        out["pct_owner"] = None
+        out["pct_renter"] = None
+
+    return out
+
+
+# ======================================
+# OpenAI (Responses API)
+# ======================================
+def openai_generate(prompt: str, api_key: str, model: str) -> str:
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "input": prompt,
-        "temperature": 0.35,
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    payload = {"model": model, "input": prompt, "temperature": 0.35}
+    r = requests.post(url, headers=headers, json=payload, timeout=120)
     r.raise_for_status()
     data = r.json()
 
@@ -187,27 +369,48 @@ def openai_generate_report(prompt: str, api_key: str, model: str) -> str:
     return "\n".join(out).strip()
 
 
-# =========================
-# Prompt Builder (McKinsey style)
-# =========================
+# ======================================
+# Text Sanitization (Stop Markdown leakage)
+# ======================================
+def sanitize_text(text: str) -> str:
+    """
+    Removes common Markdown artifacts if model leaks them.
+    This is a safety net; prompt already forbids Markdown.
+    """
+    # Remove headings like ###, ##, #
+    text = re.sub(r'^\s{0,3}#{1,6}\s*', '', text, flags=re.M)
+    # Remove bold markers **text**
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    # Remove markdown table separator lines
+    text = re.sub(r'^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$', '', text, flags=re.M)
+    # Remove stray backticks
+    text = text.replace("```", "").replace("`", "")
+    # Normalize bullets
+    text = text.replace("•", "-")
+    return text.strip()
+
+
+# ======================================
+# Prompt Builder (Consulting-grade, no Markdown)
+# ======================================
 def build_prompt(
     place: Dict[str, Any],
     inputs: ReportInputs,
     competitor_places: List[Dict[str, Any]],
+    acs: Optional[Dict[str, Any]],
 ) -> str:
     def safe(d, k, default=None):
         if not isinstance(d, dict):
             return default
         return d.get(k, default)
 
-    # compress reviews sample
     reviews = safe(place, "reviews", []) or []
     reviews_sample = []
     for rv in reviews[:10]:
         reviews_sample.append({
             "rating": rv.get("rating"),
-            "relative_time_description": rv.get("relative_time_description"),
-            "text": (rv.get("text") or "")[:280]
+            "time": rv.get("relative_time_description"),
+            "text": (rv.get("text") or "")[:260]
         })
 
     comp_brief = []
@@ -237,34 +440,30 @@ def build_prompt(
         "trade_area": {
             "radius_miles": inputs.radius_miles,
             "city": "San Francisco",
-            "zip_hint": "94116",
+            "approximation_note": "demographics use tract-level ACS near restaurant coordinate (proxy for trade area)",
         },
+        "demographics_acs": acs or {"note": "ACS not available; propose data collection plan"},
         "platform_links": inputs.platform_links,
-        "competitors": comp_brief,
-        "competitor_names_input": inputs.competitor_names,
+        "competitors_google": comp_brief,
+        "competitors_user_input": inputs.competitors,
+        "competitor_menu_notes": inputs.competitor_menu_notes,
+        "order_upload_meta": inputs.order_upload_meta,
+        "extra_business_context": inputs.extra_business_context,
     }
 
+    # Hard constraints: NO MARKDOWN. Output with section tags only.
     return f"""
-你是 AuraInsight 的咨询顾问。请基于给定数据，输出一份“麦肯锡风格”的《门店商圈与增长诊断报告》（中文为主，保留英文主标题），要求：
+你是 AuraInsight 的咨询顾问。请基于输入 JSON，输出一份“麦肯锡风格”的《门店商圈与增长诊断报告》文本，中文为主，允许少量英文标题。
+必须遵守：
 
-写作规则：
-- 结论先行：每个章节开头给 2–4 条 Key Takeaways（要短、要硬、要可验证）。
-- 数据说话：必须引用输入 JSON 中已有数据（评分 rating、评价数 user_ratings_total、营业时间、竞对对比、评论关键词等）。对无法直接量化的内容，用“可验证指标 + 采数方式”表达，避免空泛。
-- 输出结构必须包含并按顺序排列：
-  Executive Summary
-  1. Trade Area Definition & Demand Fundamentals
-  2. Platform Ecosystem Analysis（Direct/UberEats/Fantuan/HungryPanda 的角色分工 + KPI）
-  3. Competitive Landscape（竞对至少3家：线上效率/信任资产/平台覆盖/风险点）
-  4. Pricing & Order Economics（价格带、锚点、动态调价机制：含每月价格基准化流程）
-  5. Time-based Demand Structure（午餐/晚餐/下午茶/夜宵：策略与验证指标）
-  6. Strategic Implications（数据型结论）
-  7. Strategic Initiatives & Execution Roadmap（重点写深：各平台菜单结构调整、竞对价格对齐、运营期动态调价、虚拟店/虚拟品牌如“华记冰室”的上线策略、KPI与里程碑）
-  Data Gaps（数据缺口清单：为了下次报告更精准，需要补充哪些字段）
-
-风格：
-- 专业、克制、像咨询交付物。
-- 不要夸张营销语。
-- 可以使用小表格（文本形式即可）。
+A) 严禁输出 Markdown 语法（不要出现：#、##、**、|---|、```、[]()）。否则算失败。
+B) 报告只能用以下结构标记：
+   - 章节标题用： 【章节标题】
+   - 列表用： - 文字
+   - 小表格用： 表格: 然后用“列1,列2,列3”CSV样式输出（最多6行）
+C) 每章开头必须先给 2–4 条 Key Takeaways（短句、可验证、含数字优先）。
+D) 所有建议必须“可验证”：每条建议包含【动作】【原因】【预期影响】【KPI】【2周验证方法】。
+E) 必须应用：STP（客群分层）、JTBD（下单动机）、Menu Engineering（星/牛/谜/狗）、Anchoring（锚点定价）、ERRC（蓝海四动作），并解释为何适用于该商圈与竞对。
 
 报告信息：
 - 报告日期：{inputs.report_date}
@@ -273,14 +472,25 @@ def build_prompt(
 - 地址：{inputs.address}
 - 配送半径：{inputs.radius_miles} miles
 
-数据输入(JSON)：
+输出章节顺序必须如下（标题一字不差）：
+【Executive Summary】
+【1. Trade Area & Demographics】
+【2. Customer Segments & JTBD】
+【3. Platform Ecosystem Strategy】
+【4. Competitive Landscape & Differentiation】
+【5. Pricing, Anchors & Promo Economics】
+【6. Menu Architecture & Menu Engineering】
+【7. Operating Playbook & 30/60/90 Roadmap】
+【Data Gaps & How to Collect】
+
+输入 JSON：
 {json.dumps(data_blob, ensure_ascii=False, indent=2)}
 """.strip()
 
 
-# =========================
+# ======================================
 # PDF Rendering
-# =========================
+# ======================================
 def draw_bg(c: canvas.Canvas, bg_path: str):
     if bg_path and os.path.exists(bg_path):
         c.drawImage(bg_path, 0, 0, width=PAGE_W, height=PAGE_H, mask="auto")
@@ -293,12 +503,14 @@ def wrap_lines(text: str, max_chars: int) -> List[str]:
         if not para.strip():
             lines.append("")
             continue
-        lines.extend(textwrap.wrap(para, width=max_chars, break_long_words=False, replace_whitespace=False))
+        lines.extend(textwrap.wrap(
+            para, width=max_chars,
+            break_long_words=False, replace_whitespace=False
+        ))
     return lines
 
 
 def draw_footer(c: canvas.Canvas, report_date: str, page_num: int):
-    # Footer style: subtle, consulting-like
     c.setFillColor(colors.HexColor("#7A7A7A"))
     c.setFont(f_en(False), 8)
     c.drawString(0.75 * inch, 0.55 * inch, f"Confidential | Generated by AuraInsight | {report_date}")
@@ -306,137 +518,186 @@ def draw_footer(c: canvas.Canvas, report_date: str, page_num: int):
     c.setFillColor(colors.black)
 
 
-def render_pdf(report_text: str, inputs: ReportInputs, bg_cover: str, bg_content: str) -> str:
+def parse_sections(text: str) -> List[Tuple[str, str]]:
+    """
+    Split by 【Section】 tags.
+    Returns list of (title, body).
+    """
+    text = text.strip()
+    # Find all section headers
+    pattern = r'(【[^【】]+】)'
+    parts = re.split(pattern, text)
+    # parts like: ["", "【A】", "body", "【B】", "body2"...]
+    sections = []
+    cur_title = None
+    cur_body = []
+    for p in parts:
+        if not p:
+            continue
+        if p.startswith("【") and p.endswith("】"):
+            if cur_title is not None:
+                sections.append((cur_title, "\n".join(cur_body).strip()))
+            cur_title = p.replace("【", "").replace("】", "").strip()
+            cur_body = []
+        else:
+            cur_body.append(p)
+    if cur_title is not None:
+        sections.append((cur_title, "\n".join(cur_body).strip()))
+    return sections
+
+
+def render_pdf(
+    report_text: str,
+    inputs: ReportInputs,
+    bg_cover: str,
+    bg_content: str,
+    draw_content_header: bool,
+) -> str:
     register_aurainsight_fonts()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     safe_name = "".join([ch if ch.isalnum() or ch in ("_", "-", " ") else "_" for ch in inputs.restaurant_en]).strip()
     safe_name = safe_name.replace(" ", "_") or "Restaurant"
-
     filename = f"AuraInsight_{safe_name}_{inputs.report_date.replace('/','-')}.pdf"
     out_path = os.path.join(OUTPUT_DIR, filename)
 
     c = canvas.Canvas(out_path, pagesize=letter)
 
-    # ---- Cover Page ----
+    # ---- Cover ----
     draw_bg(c, bg_cover)
-
-    # Cover typography coordinates tuned for your style
     c.setFillColor(colors.HexColor("#1F2A33"))
     c.setFont(f_en(True), 26)
     c.drawCentredString(PAGE_W / 2, 315, "AuraInsight")
 
-    c.setFont(f_cn(True), 18)
     c.setFillColor(colors.black)
+    c.setFont(f_cn(True), 18)
     c.drawCentredString(PAGE_W / 2, 285, "【门店分析报告】")
 
-    c.setFont(f_en(False), 11)
     c.setFillColor(colors.HexColor("#333333"))
+    c.setFont(f_en(False), 11)
     c.drawCentredString(PAGE_W / 2, 260, inputs.report_date)
 
-    c.setFont(f_cn(False), 15)
     c.setFillColor(colors.black)
+    c.setFont(f_cn(False), 15)
     c.drawCentredString(PAGE_W / 2, 165, inputs.restaurant_cn or inputs.restaurant_en)
 
-    c.setFont(f_en(False), 12)
     c.setFillColor(colors.HexColor("#333333"))
+    c.setFont(f_en(False), 12)
     c.drawCentredString(PAGE_W / 2, 144, inputs.restaurant_en)
 
     c.setFont(f_en(False), 10)
-    c.setFillColor(colors.HexColor("#333333"))
     c.drawCentredString(PAGE_W / 2, 124, inputs.address)
 
     c.showPage()
 
-    # ---- Content Pages ----
+    # ---- Content pages ----
     draw_bg(c, bg_content)
     page_num = 1
 
-    # Header (first content page)
     left = 0.85 * inch
-    right = PAGE_W - 0.85 * inch
     top = PAGE_H - 1.05 * inch
+    y = top
 
-    c.setFillColor(colors.black)
-    c.setFont(f_en(True), 16)
-    c.drawString(left, top, "Trade Area & Growth Diagnostic Report")
-    c.setFont(f_en(False), 10)
-    c.setFillColor(colors.HexColor("#333333"))
-    c.drawString(left, top - 16, "Data-driven | Community-based | Legacy Brand")
+    if draw_content_header:
+        c.setFillColor(colors.black)
+        c.setFont(f_en(True), 16)
+        c.drawString(left, y, "Trade Area & Growth Diagnostic Report")
+        c.setFont(f_en(False), 10)
+        c.setFillColor(colors.HexColor("#333333"))
+        c.drawString(left, y - 16, "Data-driven | Community-based | Legacy Brand")
+        y -= 40
+    else:
+        # Start lower a bit to avoid overlapping any pre-printed header in background
+        y -= 10
 
-    y = top - 40
-
-    # Rendering logic: chunk by paragraphs, apply heading styles when detected
-    paragraphs = [p.strip() for p in report_text.split("\n\n") if p.strip()]
-
-    def new_content_page():
+    def new_page():
         nonlocal y, page_num
         draw_footer(c, inputs.report_date, page_num)
         c.showPage()
         page_num += 1
         draw_bg(c, bg_content)
-        y = PAGE_H - 1.05 * inch
+        y = top
+        if draw_content_header:
+            c.setFillColor(colors.black)
+            c.setFont(f_en(True), 16)
+            c.drawString(left, y, "Trade Area & Growth Diagnostic Report")
+            c.setFont(f_en(False), 10)
+            c.setFillColor(colors.HexColor("#333333"))
+            c.drawString(left, y - 16, "Data-driven | Community-based | Legacy Brand")
+            y -= 40
+        else:
+            y -= 10
 
-    def draw_heading(text: str):
+    def draw_heading(title: str):
         nonlocal y
-        if y < 1.4 * inch:
-            new_content_page()
+        if y < 1.6 * inch:
+            new_page()
         c.setFillColor(colors.black)
-        c.setFont(f_en(True), 13)  # heading in English bold by default
-        # If it looks Chinese-heavy, use CN bold
-        if any("\u4e00" <= ch <= "\u9fff" for ch in text):
-            c.setFont(f_cn(True), 13)
-        c.drawString(left, y, text[:120])
+        # Use CN bold if contains Chinese, else EN bold
+        font = f_cn(True) if any("\u4e00" <= ch <= "\u9fff" for ch in title) else f_en(True)
+        c.setFont(font, 13)
+        c.drawString(left, y, title[:120])
         y -= 18
 
     def draw_body(text: str):
         nonlocal y
-        if y < 1.4 * inch:
-            new_content_page()
-        c.setFillColor(colors.black)
-
-        # Choose font based on Chinese presence
-        has_cn = any("\u4e00" <= ch <= "\u9fff" for ch in text)
-        body_font = f_cn(False) if has_cn else f_en(False)
-
-        c.setFont(body_font, 10)
-        max_chars = 110  # conservative; depends on font
-        lines = wrap_lines(text, max_chars)
-
-        for line in lines:
+        # For PDF stability: use Noto for mixed lines; Roboto only for pure ASCII lines
+        max_chars = 110
+        for line in wrap_lines(text, max_chars):
             if y < 1.2 * inch:
-                new_content_page()
+                new_page()
+            font = f_en(False) if is_ascii_line(line) else f_cn(False)
+            c.setFillColor(colors.black)
+            c.setFont(font, 10)
             c.drawString(left, y, line)
             y -= 14
-        y -= 6
+        y -= 8
 
-    # Simple heading detection
-    heading_starts = (
-        "Executive Summary",
-        "1.", "2.", "3.", "4.", "5.", "6.", "7.",
-        "Data Gaps", "数据缺口", "附录", "Appendix"
-    )
+    sections = parse_sections(report_text)
+    if not sections:
+        # fallback: treat whole text as body
+        draw_body(report_text)
+    else:
+        for title, body in sections:
+            draw_heading(title)
+            if body:
+                draw_body(body)
 
-    for p in paragraphs:
-        first_line = p.splitlines()[0].strip()
-
-        if first_line.startswith(heading_starts):
-            draw_heading(first_line)
-            rest = "\n".join(p.splitlines()[1:]).strip()
-            if rest:
-                draw_body(rest)
-        else:
-            draw_body(p)
-
-    # Footer last page
     draw_footer(c, inputs.report_date, page_num)
     c.save()
     return out_path
 
 
-# =========================
+# ======================================
+# Order Upload (Lightweight meta extraction)
+# ======================================
+def summarize_uploaded_orders(files: List[Any]) -> Dict[str, Any]:
+    """
+    Do NOT attempt deep parsing of each platform export (too many variants).
+    We extract: filename, rows, columns, date columns guess.
+    """
+    meta = {"files": [], "notes": "Provide platform exports (CSV). System summarizes schema for analysis."}
+    for f in files:
+        try:
+            df = pd.read_csv(f)
+            cols = list(df.columns)[:50]
+            meta["files"].append({
+                "name": getattr(f, "name", "uploaded.csv"),
+                "rows": int(df.shape[0]),
+                "cols_sample": cols,
+                "date_col_guess": next((c for c in cols if "date" in c.lower() or "time" in c.lower()), None),
+            })
+        except Exception as e:
+            meta["files"].append({
+                "name": getattr(f, "name", "uploaded"),
+                "error": str(e)[:200]
+            })
+    return meta
+
+
+# ======================================
 # Streamlit UI
-# =========================
+# ======================================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
@@ -453,7 +714,11 @@ with st.sidebar:
     bg_content = st.text_input("内容页背景图路径", BG_CONTENT_DEFAULT)
 
     st.divider()
-    st.caption("字体文件（需已上传到 assets/fonts/）")
+    draw_content_header = st.checkbox("内容页额外绘制页眉（背景图无页眉才勾）", value=False)
+    st.caption("如果你背景图内容页本身已有标题栏，请不要勾选，避免重影。")
+
+    st.divider()
+    st.caption("字体文件（assets/fonts/）需存在：")
     st.code(
         "NotoSansSC-Regular.ttf\n"
         "NotoSansSC-Bold.ttf\n"
@@ -467,11 +732,13 @@ if not google_key:
 if not openai_key:
     st.warning("未检测到 OPENAI_API_KEY，请在 .streamlit/secrets.toml 配置。")
 
+# -------------------------
+# Step 1: Address -> Nearby -> Select restaurant
+# -------------------------
 st.subheader("Step 1｜输入地址 → 搜索附近餐厅")
-address_input = st.text_input("输入地址（用于定位与搜索附近餐厅）", value="2406 19th Ave, San Francisco, CA 94116")
+address_input = st.text_input("输入地址（用于定位并搜索附近餐厅）", value="2406 19th Ave, San Francisco, CA 94116")
 
 colA, colB = st.columns([1, 1])
-
 with colA:
     if st.button("搜索附近餐厅", type="primary", disabled=not google_key):
         geo = google_geocode(address_input, google_key)
@@ -480,18 +747,16 @@ with colA:
         else:
             lat, lng = geo
             places = google_nearby_restaurants(lat, lng, google_key, radius_m=nearby_radius_m)
-            st.session_state["places"] = places
             st.session_state["geo"] = (lat, lng)
+            st.session_state["places"] = places
             st.success(f"已找到 {len(places)} 家附近餐厅。")
 
 places = st.session_state.get("places", [])
+geo = st.session_state.get("geo", None)
 
 selected_place_id = None
-place_details = st.session_state.get("place_details", {})
-
 if places:
-    options = []
-    id_map = {}
+    options, id_map = [], {}
     for p in places:
         name = p.get("name", "")
         addr = p.get("vicinity", "")
@@ -514,12 +779,30 @@ if places:
                 st.error("拉取详情失败。")
             else:
                 st.session_state["place_details"] = details
-                place_details = details
                 st.success("已拉取餐厅详情。")
 
+place_details = st.session_state.get("place_details", {})
+
+# -------------------------
+# Step 2: Demographics (ACS) + Competitors links + uploads
+# -------------------------
 if place_details:
-    st.subheader("Step 2｜确认信息 + 填平台链接 + 配竞对")
-    col1, col2 = st.columns(2)
+    st.subheader("Step 2｜自动补齐商圈人口/收入等 + 竞对平台链接 + 数据补录入口")
+
+    # Get lat/lng from place details
+    rest_lat = None
+    rest_lng = None
+    try:
+        loc = place_details.get("geometry", {}).get("location", {})
+        rest_lat = float(loc.get("lat"))
+        rest_lng = float(loc.get("lng"))
+    except Exception:
+        pass
+
+    acs_data = None
+    tract_info = None
+
+    col1, col2 = st.columns([1, 1])
 
     with col1:
         restaurant_en = st.text_input("餐厅英文名", value=place_details.get("name", ""))
@@ -530,89 +813,178 @@ if place_details:
         total = place_details.get("user_ratings_total", "")
         st.caption(f"Google 数据：⭐{rating}（{total} reviews）")
 
-    with col2:
-        st.markdown("### 平台链接（建议填全）")
-        direct_url = st.text_input("Direct / order.online", value="")
-        uber_url = st.text_input("Uber Eats", value="")
-        fantuan_url = st.text_input("饭团 Fantuan", value="")
-        panda_url = st.text_input("HungryPanda 熊猫", value="")
-
-        st.markdown("### 竞对（每行一个）")
-        competitor_names = st.text_area(
-            "竞对名单",
-            value="Smile House Cafe\n凤凰聚会\n大家乐",
+        extra_context = st.text_area(
+            "补充业务背景（可选）",
+            value="例如：经营年限、主打菜、目标客群、当前痛点（单量/评分/利润/人手等）。",
             height=110
         )
 
-    # Competitor pull
-    competitors = [x.strip() for x in competitor_names.splitlines() if x.strip()]
+    with col2:
+        st.markdown("### 平台链接（门店自身）")
+        direct_url = st.text_input("Direct / order.online", value="")
+        uber_url = st.text_input("Uber Eats", value="")
+        doordash_url = st.text_input("DoorDash（可选）", value="")
+        fantuan_url = st.text_input("饭团 Fantuan", value="")
+        panda_url = st.text_input("HungryPanda 熊猫", value="")
+
+    # ACS fetch
+    with st.expander("自动获取商圈人口/收入/年龄/族裔/租住比例（US Census ACS）", expanded=True):
+        if rest_lat and rest_lng:
+            if st.button("获取 ACS 商圈画像（自动）"):
+                tract_info = census_tract_from_latlng(rest_lat, rest_lng)
+                if not tract_info:
+                    st.warning("无法获取 tract 信息（Census geocoder）。")
+                else:
+                    acs_data = acs_5y_profile(
+                        state=tract_info["STATE"],
+                        county=tract_info["COUNTY"],
+                        tract=tract_info["TRACT"],
+                        year=2023
+                    )
+                    st.session_state["tract_info"] = tract_info
+                    st.session_state["acs_data"] = acs_data
+                    if acs_data:
+                        st.success("已获取 ACS 数据（tract 级别代理）。")
+                    else:
+                        st.warning("ACS 数据返回为空。")
+        else:
+            st.info("未能从 Google Place Details 获取坐标，无法调用 ACS。")
+
+        tract_info = st.session_state.get("tract_info", tract_info)
+        acs_data = st.session_state.get("acs_data", acs_data)
+
+        if acs_data:
+            # Show a compact summary
+            pop = acs_data.get("pop_total")
+            inc = acs_data.get("median_income")
+            age = acs_data.get("median_age")
+            pct_asian = acs_data.get("pct_asian")
+            pct_renter = acs_data.get("pct_renter")
+            st.write({
+                "ACS Year": acs_data.get("year"),
+                "Geography": acs_data.get("name"),
+                "Population (tract)": None if pop is None else int(pop),
+                "Median HH Income": None if inc is None else f"${int(inc):,}",
+                "Median Age": age,
+                "% Asian (proxy)": None if pct_asian is None else f"{pct_asian*100:.1f}%",
+                "% Renter (proxy)": None if pct_renter is None else f"{pct_renter*100:.1f}%",
+                "Note": "ACS 为 tract 级别代理，作为 3–4 miles 商圈的近似画像；报告中会明确该假设。"
+            })
+
+    # Competitors editor with platform links
+    st.markdown("### 竞对信息（可增删行：用于差异化与菜单策略）")
+    default_comp = pd.DataFrame([
+        {"name": "Smile House Cafe", "ubereats": "", "doordash": "", "fantuan": "", "hungrypanda": "", "website": "", "notes": ""},
+        {"name": "凤凰聚会", "ubereats": "", "doordash": "", "fantuan": "", "hungrypanda": "", "website": "", "notes": ""},
+        {"name": "大家乐", "ubereats": "", "doordash": "", "fantuan": "", "hungrypanda": "", "website": "", "notes": ""},
+    ])
+    comp_df = st.data_editor(
+        default_comp,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="comp_editor"
+    )
+    competitors = comp_df.fillna("").to_dict("records")
+
+    # Optional: pull competitor Google details
     competitor_places = st.session_state.get("competitor_places", [])
-
-    colX, colY = st.columns([1, 1])
-
-    with colX:
-        if st.button("拉取竞对 Google 数据（可选）", disabled=not google_key):
+    colx, coly = st.columns([1, 1])
+    with colx:
+        if st.button("（可选）拉取竞对 Google 数据", disabled=not google_key):
             pulled = []
-            for name in competitors[:8]:
-                pid = google_textsearch_place_id(f"{name} San Francisco", google_key)
+            for row in competitors[:8]:
+                nm = (row.get("name") or "").strip()
+                if not nm:
+                    continue
+                pid = google_textsearch_place_id(f"{nm} San Francisco", google_key)
                 if pid:
                     pulled.append(google_place_details(pid, google_key))
             st.session_state["competitor_places"] = pulled
             competitor_places = pulled
-            st.success(f"已拉取 {len(pulled)} 家竞对详情。")
+            st.success(f"已拉取 {len(pulled)} 家竞对 Google 详情。")
+    with coly:
+        st.caption("提示：Google 数据用于“信任资产/评价量/营业时间对比”；菜单/价格差异需平台链接或手动补录。")
 
-    with colY:
-        st.caption("提示：竞对数据越完整，报告越“数据化”。")
+    # Competitor menu notes (semi-auto)
+    with st.expander("竞对菜单/价格补录（强烈建议，提升差异化分析深度）", expanded=False):
+        comp_menu_notes = st.text_area(
+            "你可以粘贴：竞对 Top 20 菜品+价格 / 套餐结构 / 主推品类 / 活动信息（任意格式均可）",
+            value="",
+            height=160
+        )
+        st.caption("建议：每个竞对至少给 10–20 个菜品与价格（或截图转文字），差异化建议会明显更“硬”。")
 
-    st.subheader("Step 3｜生成深度分析（ChatGPT）")
+    # Order exports upload
+    with st.expander("上传订单报表（CSV，可选：用于时段/客单/热销/KPI）", expanded=False):
+        uploads = st.file_uploader("上传平台订单导出 CSV（可多选）", type=["csv"], accept_multiple_files=True)
+        order_meta = {}
+        if uploads:
+            order_meta = summarize_uploaded_orders(uploads)
+            st.json(order_meta)
+        else:
+            order_meta = {"files": [], "note": "No uploads"}
+
+    # Build inputs
+    st.subheader("Step 3｜生成深度分析报告（咨询级）")
     report_date = dt.datetime.now().strftime("%m/%d/%Y")
 
     platform_links = {
         "direct": direct_url.strip(),
         "uber_eats": uber_url.strip(),
+        "doordash": doordash_url.strip(),
         "fantuan": fantuan_url.strip(),
         "hungrypanda": panda_url.strip(),
     }
 
-    if st.button("生成咨询级报告内容", type="primary", disabled=not openai_key):
+    if st.button("生成报告内容", type="primary", disabled=not openai_key):
         inputs = ReportInputs(
             report_date=report_date,
-            restaurant_cn=restaurant_cn.strip() or restaurant_en.strip(),
+            restaurant_cn=(restaurant_cn.strip() or restaurant_en.strip()),
             restaurant_en=restaurant_en.strip(),
             address=formatted_address.strip(),
             radius_miles=radius_miles,
             platform_links=platform_links,
-            competitor_names=competitors,
+            competitors=competitors,
+            competitor_menu_notes=comp_menu_notes.strip() if 'comp_menu_notes' in locals() else "",
+            order_upload_meta=order_meta,
+            extra_business_context=extra_context.strip(),
         )
-        prompt = build_prompt(place_details, inputs, competitor_places)
 
-        with st.spinner("正在生成报告（咨询级结构 + 数据引用）..."):
-            report_text = openai_generate_report(prompt, openai_key, model=model)
+        prompt = build_prompt(
+            place=place_details,
+            inputs=inputs,
+            competitor_places=competitor_places,
+            acs=st.session_state.get("acs_data", None),
+        )
+
+        with st.spinner("正在生成咨询级报告（更深的商圈画像 + 菜单/定价/蓝海策略）..."):
+            report_text = openai_generate(prompt, openai_key, model=model)
+            report_text = sanitize_text(report_text)
 
         st.session_state["report_text"] = report_text
         st.session_state["report_inputs"] = inputs
         st.success("报告内容已生成。")
 
+# -------------------------
 # Preview + PDF
+# -------------------------
 report_text = st.session_state.get("report_text", "")
 report_inputs: Optional[ReportInputs] = st.session_state.get("report_inputs", None)
 
 if report_text and report_inputs:
     st.subheader("预览（可编辑）")
-    edited = st.text_area("报告正文（可直接改）", value=report_text, height=460)
-    st.session_state["report_text"] = edited
+    edited = st.text_area("报告正文（你可以直接修改）", value=report_text, height=520)
+    st.session_state["report_text"] = sanitize_text(edited)
 
     st.subheader("Step 4｜生成 PDF（套用封面/内容页背景图）")
-
-    colP, colQ = st.columns([1, 1])
-    with colP:
+    colp, colq = st.columns([1, 1])
+    with colp:
         if not os.path.exists(bg_cover):
             st.warning(f"封面背景图不存在：{bg_cover}")
         if not os.path.exists(bg_content):
             st.warning(f"内容页背景图不存在：{bg_content}")
-
-    with colQ:
-        st.caption("建议：背景图尽量用 1275x1650 或更高分辨率，避免打印模糊。")
+    with colq:
+        st.caption("如出现页眉重影：请在左侧取消勾选“内容页额外绘制页眉”。")
 
     if st.button("生成 PDF", type="primary"):
         with st.spinner("正在生成 PDF..."):
@@ -621,15 +993,17 @@ if report_text and report_inputs:
                 inputs=report_inputs,
                 bg_cover=bg_cover,
                 bg_content=bg_content,
+                draw_content_header=draw_content_header,
             )
         st.success("PDF 生成完成。")
         with open(pdf_path, "rb") as f:
             st.download_button(
-                label="下载 PDF",
-                data=f,
+                "下载 PDF",
+                f,
                 file_name=os.path.basename(pdf_path),
                 mime="application/pdf"
             )
         st.caption(f"输出路径：{pdf_path}")
+
 else:
     st.info("完成餐厅选择并生成报告后，这里会显示预览与 PDF 下载。")
