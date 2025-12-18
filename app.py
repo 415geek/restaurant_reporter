@@ -94,7 +94,7 @@ def logout_button():
 # ======================================
 # Config
 # ======================================
-APP_TITLE = "AuraInsight 报告生成器（Trade Area & Growth Diagnostic）"
+APP_TITLE = "AuraInsights商圈分析报告生成器（Trade Area & Growth Diagnostic）"
 OUTPUT_DIR = "output"
 ASSETS_DIR = "assets"
 FONTS_DIR = os.path.join(ASSETS_DIR, "fonts")
@@ -855,7 +855,7 @@ if report_text and report_inputs:
     edited = st.text_area("报告正文（你可以直接修改）", value=report_text, height=520)
     st.session_state["report_text"] = sanitize_text(edited)
 
-    st.subheader("Step 4｜生成 PDF（套用封面/内容页背景图）")
+    st.subheader("Step 4｜生成PDF报告")
 
     if not os.path.exists(BG_COVER):
         st.warning(f"封面背景图不存在：{BG_COVER}")
