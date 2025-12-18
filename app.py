@@ -426,7 +426,7 @@ def build_prompt(
     }
 
     return f"""
-You are AuraInsight's strategy consultant. Based on the input JSON, produce a consulting-grade “Trade Area & Growth Diagnostic Report” for a legacy Hong Kong-style restaurant in San Francisco.
+You are AuraInsight's strategy consultant. Based on the input JSON, produce a consulting-grade “Trade Area & Growth Diagnostic Report” for a legacy Hong Kong-style restaurant in San Francisco,also prodece a specific deail step by step plan for improvement.
 
 STRICT FORMAT RULES (failure if violated):
 A) Do NOT output Markdown. Do not use: #, ##, **, |---|, ``` , []().
