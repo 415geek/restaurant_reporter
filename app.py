@@ -1272,10 +1272,11 @@ if report_text and report_inputs:
     if report_inputs.charts:
         cols = st.columns(2)
         i = 0
-        for k, v in report_inputs.charts.items():
-            with cols[i % 2]:
-                st.caption(k)
+        for k, v in charts.items():
+            if isinstance(v, str) and os.path.exists(v):
                 st.image(v, use_container_width=True)
+            else:
+                st.warning(f"Chart {k} 未生成图片，已跳过")
             i += 1
     else:
         st.info("暂无图表（通常是菜单价格识别不足导致 price 缺失）。")
