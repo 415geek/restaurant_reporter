@@ -3,3 +3,6 @@ requests==2.32.3
 reportlab==4.2.2
 python-dateutil==2.9.0.post0
 pillow==10.4.0
+pandas
+matplotlib
+openpyxl
