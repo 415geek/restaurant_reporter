@@ -230,14 +230,10 @@ def parse_sections(text: str) -> List[Tuple[str, str]]:
     if not text:
         return []
 
-    # Normalize: ensure each numeric heading is on its own line
-    # e.g. "5. Pricing..." stays.
     lines = text.splitlines()
     norm = []
     for ln in lines:
-        ln = ln.rstrip()
-        # If heading appears mid-line, keep it (best effort).
-        norm.append(ln)
+        norm.append(ln.rstrip())
     text = "\n".join(norm)
 
     sections = []
@@ -262,7 +258,6 @@ def parse_sections(text: str) -> List[Tuple[str, str]]:
             cur_body.append(ln)
 
     flush()
-    # If no headings detected, return empty to fallback to raw render
     if len(sections) == 1 and sections[0][0] and sections[0][1] == "":
         return []
     return sections
@@ -628,7 +623,6 @@ def menu_to_df(menu_meta: Dict[str, Any]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    # Clean
     df["category"] = df["category"].fillna("Uncategorized")
     return df
 
@@ -686,6 +680,345 @@ def build_charts(own_df: pd.DataFrame, comps: List[Tuple[str, pd.DataFrame]]) ->
         charts["chart_comp_median_price"] = make_png(fig)
 
     return charts
+
+
+# =========================================================
+# Menu Smart Adjust (NEW)
+# =========================================================
+DEFAULT_TARGET_MEDIAN_MAIN = 18.95
+HIGH_PRICE_THRESHOLD_RATIO = 1.12
+MIN_COMBOS_REQUIRED = 4
+FRONT_LIMIT = 35
+
+def _has_chinese(s: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in (s or ""))
+
+def _split_cn_en(name: str) -> Tuple[str, str]:
+    """
+    尝试从 name 中拆出中英文。无法拆就：中文/英文都填 name（不强行猜）。
+    """
+    name = (name or "").strip()
+    if not name:
+        return "", ""
+    if _has_chinese(name) and re.search(r"[A-Za-z]", name):
+        # 粗暴拆：把中文和英文各自提取
+        cn = "".join([ch for ch in name if "\u4e00" <= ch <= "\u9fff" or ch in "（）()·•- "]).strip()
+        en = re.sub(r"[\u4e00-\u9fff（）()·•]", " ", name)
+        en = re.sub(r"\s+", " ", en).strip()
+        return cn, en
+    # 仅中文或仅英文
+    if _has_chinese(name):
+        return name, ""
+    return "", name
+
+def normalize_extracted_items(menu_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = (((menu_meta or {}).get("extracted") or {}).get("items") or [])
+    out = []
+    seen = set()
+    for it in rows:
+        name = (it.get("name") or "").strip()
+        if not name:
+            continue
+        cn, en = _split_cn_en(name)
+        price = _to_price(it.get("price"))
+        cat = (it.get("category") or "").strip()
+        notes = (it.get("notes") or "").strip()
+
+        key = (cn.lower(), en.lower(), price, cat.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        out.append({
+            "name_cn": cn,
+            "name_en": en,
+            "price": price,
+            "raw_category": cat if cat else "Uncategorized",
+            "notes": notes,
+        })
+    return out
+
+def item_fullname(it: Dict[str, Any]) -> str:
+    cn = (it.get("name_cn") or "").strip()
+    en = (it.get("name_en") or "").strip()
+    if cn and en:
+        return f"{en} {cn}".strip()
+    return cn or en
+
+def classify_item(it: Dict[str, Any]) -> str:
+    name = (item_fullname(it) or "").lower()
+    cat = (it.get("raw_category") or "").lower()
+    notes = (it.get("notes") or "").lower()
+    blob = " ".join([name, cat, notes])
+
+    # Combo
+    if any(k in blob for k in ["套餐", "超值", "combo", "value", "set", "bundle"]):
+        return "combo"
+    # Add-on
+    if any(k in blob for k in ["加", "加配", "升级", "upgrade", "add-on", "addon", "extra", "+$"]):
+        return "addon"
+    # Drink
+    if any(k in blob for k in [
+        "奶茶","milk tea","柠檬","lemon","coffee","咖啡","soda","汽水","coconut","椰子",
+        "jasmine","茉莉","chrysanthemum","菊花","prunella","夏枯草","tea","茶"
+    ]):
+        return "drink"
+    # Main (rough)
+    if any(k in blob for k in ["饭","rice","河粉","chow fun","炒面","noodle","意粉","spaghetti","粉","面","焗","baked"]):
+        return "main"
+    return "other"
+
+def split_by_type(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    out = {"main": [], "drink": [], "combo": [], "addon": [], "other": []}
+    for it in items:
+        t = classify_item(it)
+        it["type"] = t
+        out[t].append(it)
+    return out
+
+def median_price(items: List[Dict[str, Any]]) -> Optional[float]:
+    prices = [it["price"] for it in items if isinstance(it.get("price"), (int, float)) and it["price"] and it["price"] > 0]
+    if not prices:
+        return None
+    s = sorted(prices)
+    n = len(s)
+    if n % 2 == 1:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+def detect_combo_system(combos: List[Dict[str, Any]], min_required: int) -> bool:
+    return len(combos) >= min_required
+
+def is_menu_overpriced(mains: List[Dict[str, Any]], target_median: float, ratio: float) -> Tuple[bool, Optional[float]]:
+    cur = median_price(mains)
+    if cur is None:
+        return False, None
+    return (cur > target_median * ratio), cur
+
+def scale_prices(items: List[Dict[str, Any]], scale: float) -> List[Dict[str, Any]]:
+    adjusted = []
+    for it in items:
+        p = it.get("price")
+        it2 = dict(it)
+        it2["price_old"] = p
+        if isinstance(p, (int, float)) and p > 0:
+            it2["price"] = round(float(p) * scale, 2)
+        adjusted.append(it2)
+    return adjusted
+
+def safe_json_obj(text: str) -> Dict[str, Any]:
+    if not text:
+        return {}
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return {}
+
+def ai_market_benchmark(
+    items: List[Dict[str, Any]],
+    location: str,
+    cuisine: str,
+    target_median_main: float,
+    api_key: str,
+    model: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    用 AI 估算同地区同品类“主食合理价带”，并给出逐菜 new_price。
+    失败则返回原 items + meta(ai_error)。
+    """
+    mains = [i for i in items if classify_item(i) == "main" and isinstance(i.get("price"), (int, float)) and i["price"] and i["price"] > 0]
+    cur_med = median_price(mains) or 0
+
+    prompt = f"""
+你是北美外卖定价与菜单工程顾问。
+地点：{location}
+菜系：{cuisine}
+
+我会给你一份菜品列表（含价格）。请完成：
+1) 给出同地区同品类外卖平台“主食”常见合理中位数和合理区间（范围要可执行）。
+2) 判断整体是否偏高。
+3) 如果偏高，给出每一道菜建议的新价格（只要给出你有把握的，没把握可以不写在 adjusted_items 里）。
+
+只输出严格 JSON，不要输出任何额外文字：
+{{
+  "market_median_main": 0,
+  "market_range_main": [0,0],
+  "is_overpriced": true/false,
+  "strategy": "一句话策略",
+  "adjusted_items": [
+    {{"name":"", "new_price":0}}
+  ]
+}}
+
+当前目标主食中位数倾向：{target_median_main}
+当前主食中位数（估算）：{cur_med}
+
+菜品（name - price）：
+{json.dumps([{"name": item_fullname(i), "price": i.get("price")} for i in items], ensure_ascii=False)}
+""".strip()
+
+    try:
+        text_out = openai_text(prompt, api_key, model=model, temperature=0.2)
+        obj = safe_json_obj(text_out)
+        mapping = {x.get("name", ""): x.get("new_price") for x in (obj.get("adjusted_items") or [])}
+
+        adjusted = []
+        for it in items:
+            nm = item_fullname(it)
+            newp = mapping.get(nm, None)
+            it2 = dict(it)
+            it2["price_old"] = it.get("price")
+            if isinstance(newp, (int, float)) and newp > 0:
+                it2["price"] = round(float(newp), 2)
+            adjusted.append(it2)
+        return adjusted, obj
+    except Exception as e:
+        return items, {"ai_error": str(e)[:200]}
+
+def build_combos_if_missing(
+    items: List[Dict[str, Any]],
+    location: str,
+    cuisine: str,
+    api_key: str,
+    model: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    typed = split_by_type(items)
+    mains = [m for m in typed["main"] if isinstance(m.get("price"), (int, float)) and m["price"] and m["price"] > 0]
+    drinks = [d for d in typed["drink"] if isinstance(d.get("price"), (int, float)) and d["price"] and d["price"] > 0]
+
+    # pick candidates
+    mains_sorted = sorted(mains, key=lambda x: abs((x.get("price") or 0) - DEFAULT_TARGET_MEDIAN_MAIN))
+    mains_pick = mains_sorted[:6]
+    drinks_pick = drinks[:4]
+
+    new_combos = []
+    for i, main in enumerate(mains_pick):
+        if not drinks_pick:
+            break
+        drink = drinks_pick[i % len(drinks_pick)]
+        base = (main["price"] or 0) + (drink["price"] or 0)
+        combo_price = round(base - 1.50, 2)
+
+        combo_name_cn = f"超值套餐｜{(main.get('name_cn') or '主食')} + {(drink.get('name_cn') or '饮品')}"
+        combo_name_en = f"Value Combo | {(main.get('name_en') or 'Main')} + {(drink.get('name_en') or 'Drink')}"
+        new_combos.append({
+            "name_cn": combo_name_cn,
+            "name_en": combo_name_en,
+            "price": combo_price,
+            "raw_category": "Value Combos",
+            "notes": "Auto-generated combo",
+            "type": "combo",
+        })
+
+    meta = {"generated_combos": len(new_combos), "ai_combo_optimized": False}
+
+    # AI optimize combo names/prices (best effort)
+    if api_key:
+        try:
+            prompt = f"""
+你是外卖套餐工程师。地点：{location}，菜系：{cuisine}
+我生成了一批套餐（主食+饮品）。请优化：
+1) 套餐命名：更像平台爆品，简短、明确、利于点击
+2) 套餐价格：保持“比单点更划算”的感知；不要低到不赚钱
+只输出严格JSON：
+{{
+  "combos":[{{"idx":0,"name_cn":"","name_en":"","price":0}}]
+}}
+当前套餐：
+{json.dumps(new_combos, ensure_ascii=False)}
+""".strip()
+            out = openai_text(prompt, api_key, model=model, temperature=0.2)
+            obj = safe_json_obj(out)
+            combos_out = obj.get("combos") or []
+            for row in combos_out:
+                idx = row.get("idx")
+                if isinstance(idx, int) and 0 <= idx < len(new_combos):
+                    if row.get("name_cn"): new_combos[idx]["name_cn"] = row["name_cn"]
+                    if row.get("name_en"): new_combos[idx]["name_en"] = row["name_en"]
+                    if isinstance(row.get("price"), (int, float)) and row["price"] > 0:
+                        new_combos[idx]["price"] = round(float(row["price"]), 2)
+            meta["ai_combo_optimized"] = True
+        except Exception as e:
+            meta["ai_error"] = str(e)[:200]
+
+    merged = items + new_combos
+    # re-dedup
+    seen = set()
+    dedup = []
+    for it in merged:
+        key = (item_fullname(it).lower(), it.get("price"), (it.get("raw_category") or "").lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(it)
+    return dedup, meta
+
+def build_smart_menu(items: List[Dict[str, Any]], front_limit: int = FRONT_LIMIT) -> Dict[str, Any]:
+    typed = split_by_type(items)
+    mains = [m for m in typed["main"] if isinstance(m.get("price"), (int, float)) and m["price"] and m["price"] > 0]
+    drinks = [d for d in typed["drink"] if isinstance(d.get("price"), (int, float)) and d["price"] and d["price"] > 0]
+    combos = [c for c in typed["combo"] if isinstance(c.get("price"), (int, float)) and c["price"] and c["price"] > 0]
+    addons = [a for a in typed["addon"] if isinstance(a.get("price"), (int, float)) and a["price"] and a["price"] > 0]
+    others = typed["other"]
+
+    anchors = sorted(mains, key=lambda x: x["price"], reverse=True)[:6]
+
+    core_band = [m for m in mains if 16.0 <= float(m["price"]) <= 20.5 and m not in anchors]
+    best_sellers = sorted(core_band, key=lambda x: abs(float(x["price"]) - DEFAULT_TARGET_MEDIAN_MAIN))[:10]
+
+    front_combos = combos[:8]
+    front_addons = addons[:6]
+    front_drinks = drinks[:6]
+
+    used = set()
+    def mark_used(lst):
+        for x in lst:
+            used.add((item_fullname(x), x.get("price")))
+
+    mark_used(anchors)
+    mark_used(best_sellers)
+    mark_used(front_combos)
+    mark_used(front_addons)
+    mark_used(front_drinks)
+
+    classic = []
+    for it in items:
+        if (item_fullname(it), it.get("price")) not in used:
+            classic.append(it)
+
+    return {
+        "Chef_Signature": anchors,
+        "Best_Sellers": best_sellers,
+        "Value_Combos": front_combos,
+        "Make_It_Better": front_addons,
+        "Drinks": front_drinks,
+        "Classic_Menu": classic,
+    }
+
+def menu_to_flat_df(menu: Dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    for section, lst in menu.items():
+        for it in lst:
+            rows.append({
+                "section": section,
+                "name_cn": it.get("name_cn",""),
+                "name_en": it.get("name_en",""),
+                "name": item_fullname(it),
+                "price": it.get("price"),
+                "price_old": it.get("price_old", None),
+                "raw_category": it.get("raw_category",""),
+                "type": it.get("type", classify_item(it)),
+                "notes": it.get("notes",""),
+            })
+    return pd.DataFrame(rows)
 
 
 # =========================================================
@@ -781,7 +1114,6 @@ def build_prompt(inputs: ReportInputs) -> str:
 开始输出报告正文：
 """.strip()
 
-
 def ensure_long_enough(report_text: str, api_key: str, model: str, min_chars: int = 16000) -> str:
     t = sanitize_text(report_text)
     if len(t) >= min_chars:
@@ -834,7 +1166,6 @@ def render_pdf(report_text: str, inputs: ReportInputs) -> str:
     draw_bg(c, BG_COVER)
     c.setFillColor(colors.HexColor("#111111"))
 
-    # Only restaurant info to avoid duplication with cover design
     y_base = 210
     c.setFont(f_cn(True), 16)
     c.drawCentredString(PAGE_W / 2, y_base, inputs.restaurant_cn or inputs.restaurant_en)
@@ -852,7 +1183,7 @@ def render_pdf(report_text: str, inputs: ReportInputs) -> str:
     draw_bg(c, BG_CONTENT)
 
     left = 0.90 * inch
-    top = PAGE_H - 1.55 * inch  # push down to avoid header collision
+    top = PAGE_H - 1.55 * inch
     y = top - 0.45 * inch
 
     body_font_size = 10
@@ -860,7 +1191,7 @@ def render_pdf(report_text: str, inputs: ReportInputs) -> str:
     para_gap = 10
     heading_gap = 18
 
-    bottom_margin = 1.35 * inch  # raise bottom margin to avoid truncation
+    bottom_margin = 1.35 * inch
 
     def new_page():
         nonlocal y, page_num
@@ -882,7 +1213,6 @@ def render_pdf(report_text: str, inputs: ReportInputs) -> str:
 
     def draw_body(text: str):
         nonlocal y
-        # Slightly narrower to prevent truncation in long lines
         max_chars = 100
         for line in wrap_lines_by_chars(text, max_chars):
             if y < bottom_margin:
@@ -903,21 +1233,17 @@ def render_pdf(report_text: str, inputs: ReportInputs) -> str:
             if body.strip():
                 draw_body(body)
 
-    # Chart pages (visual pages)
+    # Chart pages
     if inputs.charts:
         for chart_name, png_bytes in inputs.charts.items():
-            # new page for each chart for clean layout
             new_page()
             draw_bg(c, BG_CONTENT)
 
-            # Title
             c.setFont(f_en(True), 13)
             c.setFillColor(colors.black)
             c.drawString(left, top - 0.25 * inch, f"Chart: {chart_name}")
 
-            # Draw image
             img = ImageReader(io.BytesIO(png_bytes))
-            # Fit image in page body
             img_w = PAGE_W - 2.0 * inch
             img_h = PAGE_H - 3.0 * inch
             c.drawImage(img, left, 1.4 * inch, width=img_w, height=img_h, preserveAspectRatio=True, anchor='c')
@@ -940,7 +1266,6 @@ with st.sidebar:
     st.header("配置")
     model = st.selectbox("OpenAI 模型", ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"], index=0)
 
-    # ✅ hide radius controls by default
     show_advanced = st.checkbox("显示高级设置", value=False)
     if show_advanced:
         radius_miles = st.slider("商圈半径（miles）", 1.0, 6.0, 4.0, 0.5)
@@ -964,330 +1289,474 @@ if not openai_key:
 if not yelp_key:
     st.info("未检测到 YELP_API_KEY（可选）。竞对 Yelp 维度会缺失。")
 
+# =========================================================
+# Tabs: Report vs Menu Smart Adjust
+# =========================================================
+tab_report, tab_menu = st.tabs(["📊 门店分析报告（PDF）", "🧠 菜单智能调整（先调价→再组套餐→出完整菜单）"])
+
 
 # =========================================================
-# Step 1: Search restaurant
+# TAB 1: REPORT (your original flow, unchanged)
 # =========================================================
-st.subheader("Step 1｜输入地址 → 搜索附近餐厅")
-address_input = st.text_input("输入地址（用于定位并搜索附近餐厅）", value="2406 19th Ave, San Francisco, CA 94116")
+with tab_report:
 
-if st.button("搜索附近餐厅", type="primary", disabled=not google_key):
-    geo = google_geocode(address_input, google_key)
-    if not geo:
-        st.error("无法解析地址，请输入更完整地址（含城市/州）。")
-    else:
-        lat, lng = geo
-        places = google_nearby_restaurants(lat, lng, google_key, radius_m=nearby_radius_m)
-        st.session_state["geo"] = (lat, lng)
-        st.session_state["places"] = places
-        st.success(f"已找到 {len(places)} 家附近餐厅。")
+    # =========================================================
+    # Step 1: Search restaurant
+    # =========================================================
+    st.subheader("Step 1｜输入地址 → 搜索附近餐厅")
+    address_input = st.text_input("输入地址（用于定位并搜索附近餐厅）", value="2406 19th Ave, San Francisco, CA 94116", key="report_address_input")
 
-places = st.session_state.get("places", [])
-place_details = st.session_state.get("place_details", {})
-
-if places:
-    options, id_map = [], {}
-    for p in places:
-        name = p.get("name", "")
-        addr = p.get("vicinity", "")
-        rating = p.get("rating", "NA")
-        total = p.get("user_ratings_total", "NA")
-        pid = p.get("place_id", "")
-        label = f"{name} | {addr} | ⭐{rating} ({total})"
-        options.append(label)
-        id_map[label] = pid
-
-    selected_label = st.selectbox("选择目标餐厅（Google Nearby）", options)
-    selected_place_id = id_map.get(selected_label)
-
-    if st.button("拉取餐厅详情（Google Place Details）", disabled=not google_key):
-        if not selected_place_id:
-            st.error("请先选择一个餐厅。")
+    if st.button("搜索附近餐厅", type="primary", disabled=not google_key, key="btn_search_nearby"):
+        geo = google_geocode(address_input, google_key)
+        if not geo:
+            st.error("无法解析地址，请输入更完整地址（含城市/州）。")
         else:
-            details = google_place_details(selected_place_id, google_key)
-            if not details:
-                st.error("拉取详情失败。")
+            lat, lng = geo
+            places = google_nearby_restaurants(lat, lng, google_key, radius_m=nearby_radius_m)
+            st.session_state["geo"] = (lat, lng)
+            st.session_state["places"] = places
+            st.success(f"已找到 {len(places)} 家附近餐厅。")
+
+    places = st.session_state.get("places", [])
+    place_details = st.session_state.get("place_details", {})
+
+    if places:
+        options, id_map = [], {}
+        for p in places:
+            name = p.get("name", "")
+            addr = p.get("vicinity", "")
+            rating = p.get("rating", "NA")
+            total = p.get("user_ratings_total", "NA")
+            pid = p.get("place_id", "")
+            label = f"{name} | {addr} | ⭐{rating} ({total})"
+            options.append(label)
+            id_map[label] = pid
+
+        selected_label = st.selectbox("选择目标餐厅（Google Nearby）", options, key="report_selected_label")
+        selected_place_id = id_map.get(selected_label)
+
+        if st.button("拉取餐厅详情（Google Place Details）", disabled=not google_key, key="btn_place_details"):
+            if not selected_place_id:
+                st.error("请先选择一个餐厅。")
             else:
-                st.session_state["place_details"] = details
-                st.success("已拉取餐厅详情。")
-                place_details = details
-
-
-# =========================================================
-# Step 2
-# =========================================================
-if place_details:
-    st.subheader("Step 2｜上传菜单 + 自动商圈画像（ACS） + 竞对（Google/Yelp + 竞对菜单上传）")
-
-    loc = (place_details.get("geometry", {}) or {}).get("location", {}) or {}
-    rest_lat = float(loc.get("lat")) if loc.get("lat") is not None else None
-    rest_lng = float(loc.get("lng")) if loc.get("lng") is not None else None
-
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        restaurant_en = st.text_input("餐厅英文名", value=place_details.get("name", ""))
-        restaurant_cn = st.text_input("餐厅中文名（可选）", value="")
-        formatted_address = st.text_input("餐厅地址", value=place_details.get("formatted_address", address_input))
-        st.caption(f"Google：⭐{place_details.get('rating','')}（{place_details.get('user_ratings_total','')} reviews）")
-        extra_context = st.text_area(
-            "补充业务背景（可选）",
-            value="例如：经营年限、主打菜、目标客群、当前痛点（单量/评分/利润/人手等）。",
-            height=120
-        )
-    with col2:
-        st.markdown("### 门店外卖菜单上传（替代平台链接）")
-        own_menu_files = st.file_uploader(
-            "上传门店菜单（png/jpg/txt/csv/xlsx，支持多文件）",
-            type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
-            accept_multiple_files=True,
-            key="own_menu_files"
-        )
-        st.caption("系统会识别：菜品、价格、分类、套餐结构、促销文案；最终写入 PDF（Appendix A + 图表页）。")
-
-    # ACS
-    with st.expander("自动获取商圈人口/收入/年龄/族裔/租住比例（US Census ACS）", expanded=True):
-        if rest_lat and rest_lng:
-            if st.button("获取 ACS 商圈画像（自动）"):
-                tract_info = census_tract_from_latlng(rest_lat, rest_lng)
-                if not tract_info:
-                    st.warning("无法获取 tract 信息（Census geocoder）。")
+                details = google_place_details(selected_place_id, google_key)
+                if not details:
+                    st.error("拉取详情失败。")
                 else:
-                    acs_data = acs_5y_profile(tract_info["STATE"], tract_info["COUNTY"], tract_info["TRACT"], year=2023)
-                    st.session_state["tract_info"] = tract_info
-                    st.session_state["acs_data"] = acs_data
-                    st.success("已获取 ACS 数据（tract 级别代理）。")
-        else:
-            st.info("未能从 Google Place Details 获取坐标，无法调用 ACS。")
+                    st.session_state["place_details"] = details
+                    st.success("已拉取餐厅详情。")
+                    place_details = details
 
-        tract_info = st.session_state.get("tract_info", None)
-        acs_data = st.session_state.get("acs_data", None)
-        if acs_data:
-            st.write({
-                "ACS Year": acs_data.get("year"),
-                "Geography": acs_data.get("name"),
-                "Population (tract)": None if acs_data.get("pop_total") is None else int(acs_data.get("pop_total")),
-                "Median HH Income": None if acs_data.get("median_income") is None else f"${int(acs_data.get('median_income')):,}",
-                "Median Age": acs_data.get("median_age"),
-                "% Asian (proxy)": None if acs_data.get("pct_asian") is None else f"{acs_data.get('pct_asian')*100:.1f}%",
-                "% Renter (proxy)": None if acs_data.get("pct_renter") is None else f"{acs_data.get('pct_renter')*100:.1f}%",
-                "Note": "ACS 为 tract 级别代理，作为商圈画像方向性参考。"
-            })
 
-    # Competitors
-    st.markdown("### 竞对信息（可增删行：用于差异化与竞品分析）")
-    if "comp_rows" not in st.session_state:
-        st.session_state.comp_rows = 3
+    # =========================================================
+    # Step 2
+    # =========================================================
+    if place_details:
+        st.subheader("Step 2｜上传菜单 + 自动商圈画像（ACS） + 竞对（Google/Yelp + 竞对菜单上传）")
 
-    cA, cB, cC = st.columns([1, 1, 2])
-    with cA:
-        if st.button("➕ 添加竞对"):
-            st.session_state.comp_rows += 1
-    with cB:
-        if st.button("➖ 删除最后一个", disabled=st.session_state.comp_rows <= 1):
-            st.session_state.comp_rows = max(1, st.session_state.comp_rows - 1)
-    with cC:
-        st.caption("每个竞对：填写名称/地址 → 拉取 Google/Yelp → 上传竞对菜单文件。")
+        loc = (place_details.get("geometry", {}) or {}).get("location", {}) or {}
+        rest_lat = float(loc.get("lat")) if loc.get("lat") is not None else None
+        rest_lng = float(loc.get("lng")) if loc.get("lng") is not None else None
 
-    comp_inputs: List[CompetitorInput] = []
-    comp_summary_rows = []
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            restaurant_en = st.text_input("餐厅英文名", value=place_details.get("name", ""), key="report_restaurant_en")
+            restaurant_cn = st.text_input("餐厅中文名（可选）", value="", key="report_restaurant_cn")
+            formatted_address = st.text_input("餐厅地址", value=place_details.get("formatted_address", address_input), key="report_formatted_address")
+            st.caption(f"Google：⭐{place_details.get('rating','')}（{place_details.get('user_ratings_total','')} reviews）")
+            extra_context = st.text_area(
+                "补充业务背景（可选）",
+                value="例如：经营年限、主打菜、目标客群、当前痛点（单量/评分/利润/人手等）。",
+                height=120,
+                key="report_extra_context"
+            )
+        with col2:
+            st.markdown("### 门店外卖菜单上传（替代平台链接）")
+            own_menu_files = st.file_uploader(
+                "上传门店菜单（png/jpg/txt/csv/xlsx，支持多文件）",
+                type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
+                accept_multiple_files=True,
+                key="own_menu_files"
+            )
+            st.caption("系统会识别：菜品、价格、分类、套餐结构、促销文案；最终写入 PDF（Appendix A + 图表页）。")
 
-    for i in range(st.session_state.comp_rows):
-        with st.container(border=True):
-            st.markdown(f"竞对 #{i+1}")
-            cc1, cc2, cc3 = st.columns([2, 2, 2])
-            with cc1:
-                comp_name = st.text_input(f"竞对名称或地址（#{i+1}）", value="", key=f"comp_name_{i}")
-            with cc2:
-                comp_notes = st.text_input(f"备注（可选 #{i+1}）", value="", key=f"comp_notes_{i}")
-            with cc3:
-                comp_menu_files = st.file_uploader(
-                    f"上传竞对菜单（#{i+1}）png/jpg/txt/csv/xlsx",
-                    type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
-                    accept_multiple_files=True,
-                    key=f"comp_menu_files_{i}"
-                )
-
-            pull_col1, pull_col2 = st.columns([1, 2])
-            with pull_col1:
-                pull = st.button(f"拉取竞对 Google + Yelp（#{i+1}）", key=f"pull_comp_{i}", disabled=not google_key)
-            with pull_col2:
-                st.caption("Google: 评分/评论/位置/营业时间；Yelp: 价格带/分类/评论示例（如配置了YELP_API_KEY）。")
-
-            comp_google = st.session_state.get(f"comp_google_{i}", {})
-            comp_yelp = st.session_state.get(f"comp_yelp_{i}", {})
-
-            if pull and comp_name.strip():
-                pid = google_textsearch_place_id(f"{comp_name} {formatted_address}", google_key)
-                comp_google = google_place_details(pid, google_key) if pid else {"error": "Google textsearch failed"}
-                st.session_state[f"comp_google_{i}"] = comp_google
-
-                if yelp_key:
-                    ysr = yelp_search_business(comp_name, formatted_address, yelp_key, limit=3)
-                    best = None
-                    if isinstance(ysr, dict) and ysr.get("businesses"):
-                        best = ysr["businesses"][0]
-                        rid = best.get("id")
-                        rev = yelp_get_reviews(rid, yelp_key) if rid else {}
-                        comp_yelp = {"best_match": best, "reviews": rev}
+        # ACS
+        with st.expander("自动获取商圈人口/收入/年龄/族裔/租住比例（US Census ACS）", expanded=True):
+            if rest_lat and rest_lng:
+                if st.button("获取 ACS 商圈画像（自动）", key="btn_get_acs"):
+                    tract_info = census_tract_from_latlng(rest_lat, rest_lng)
+                    if not tract_info:
+                        st.warning("无法获取 tract 信息（Census geocoder）。")
                     else:
-                        comp_yelp = {"error": "No Yelp match", "raw": ysr}
-                else:
-                    comp_yelp = {"note": "YELP_API_KEY not configured"}
-                st.session_state[f"comp_yelp_{i}"] = comp_yelp
+                        acs_data = acs_5y_profile(tract_info["STATE"], tract_info["COUNTY"], tract_info["TRACT"], year=2023)
+                        st.session_state["tract_info"] = tract_info
+                        st.session_state["acs_data"] = acs_data
+                        st.success("已获取 ACS 数据（tract 级别代理）。")
+            else:
+                st.info("未能从 Google Place Details 获取坐标，无法调用 ACS。")
 
-            comp_summary_rows.append({
-                "competitor": comp_name.strip(),
-                "google_rating": comp_google.get("rating", "") if isinstance(comp_google, dict) else "",
-                "google_reviews": comp_google.get("user_ratings_total", "") if isinstance(comp_google, dict) else "",
-                "yelp_rating": (comp_yelp.get("best_match", {}) or {}).get("rating", "") if isinstance(comp_yelp, dict) else "",
-                "yelp_reviews": (comp_yelp.get("best_match", {}) or {}).get("review_count", "") if isinstance(comp_yelp, dict) else "",
-                "menus_uploaded": 0 if not comp_menu_files else len(comp_menu_files),
-            })
+            tract_info = st.session_state.get("tract_info", None)
+            acs_data = st.session_state.get("acs_data", None)
+            if acs_data:
+                st.write({
+                    "ACS Year": acs_data.get("year"),
+                    "Geography": acs_data.get("name"),
+                    "Population (tract)": None if acs_data.get("pop_total") is None else int(acs_data.get("pop_total")),
+                    "Median HH Income": None if acs_data.get("median_income") is None else f"${int(acs_data.get('median_income')):,}",
+                    "Median Age": acs_data.get("median_age"),
+                    "% Asian (proxy)": None if acs_data.get("pct_asian") is None else f"{acs_data.get('pct_asian')*100:.1f}%",
+                    "% Renter (proxy)": None if acs_data.get("pct_renter") is None else f"{acs_data.get('pct_renter')*100:.1f}%",
+                    "Note": "ACS 为 tract 级别代理，作为商圈画像方向性参考。"
+                })
 
-            # placeholder meta (will be replaced after extraction during generation)
-            comp_inputs.append(
-                CompetitorInput(
-                    name_or_address=comp_name.strip(),
-                    notes=comp_notes.strip(),
-                    menu_files_meta={"label": f"COMP_{i+1}", "files": [{"name": f.name} for f in (comp_menu_files or [])],
-                                     "extracted": {"items": [], "promos": [], "notes": []}},
-                    google=comp_google if isinstance(comp_google, dict) else {},
-                    yelp=comp_yelp if isinstance(comp_yelp, dict) else {},
+        # Competitors
+        st.markdown("### 竞对信息（可增删行：用于差异化与竞品分析）")
+        if "comp_rows" not in st.session_state:
+            st.session_state.comp_rows = 3
+
+        cA, cB, cC = st.columns([1, 1, 2])
+        with cA:
+            if st.button("➕ 添加竞对", key="btn_add_comp"):
+                st.session_state.comp_rows += 1
+        with cB:
+            if st.button("➖ 删除最后一个", disabled=st.session_state.comp_rows <= 1, key="btn_del_comp"):
+                st.session_state.comp_rows = max(1, st.session_state.comp_rows - 1)
+        with cC:
+            st.caption("每个竞对：填写名称/地址 → 拉取 Google/Yelp → 上传竞对菜单文件。")
+
+        comp_inputs: List[CompetitorInput] = []
+        comp_summary_rows = []
+
+        for i in range(st.session_state.comp_rows):
+            with st.container(border=True):
+                st.markdown(f"竞对 #{i+1}")
+                cc1, cc2, cc3 = st.columns([2, 2, 2])
+                with cc1:
+                    comp_name = st.text_input(f"竞对名称或地址（#{i+1}）", value="", key=f"comp_name_{i}")
+                with cc2:
+                    comp_notes = st.text_input(f"备注（可选 #{i+1}）", value="", key=f"comp_notes_{i}")
+                with cc3:
+                    comp_menu_files = st.file_uploader(
+                        f"上传竞对菜单（#{i+1}）png/jpg/txt/csv/xlsx",
+                        type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
+                        accept_multiple_files=True,
+                        key=f"comp_menu_files_{i}"
+                    )
+
+                pull_col1, pull_col2 = st.columns([1, 2])
+                with pull_col1:
+                    pull = st.button(f"拉取竞对 Google + Yelp（#{i+1}）", key=f"pull_comp_{i}", disabled=not google_key)
+                with pull_col2:
+                    st.caption("Google: 评分/评论/位置/营业时间；Yelp: 价格带/分类/评论示例（如配置了YELP_API_KEY）。")
+
+                comp_google = st.session_state.get(f"comp_google_{i}", {})
+                comp_yelp = st.session_state.get(f"comp_yelp_{i}", {})
+
+                if pull and comp_name.strip():
+                    pid = google_textsearch_place_id(f"{comp_name} {formatted_address}", google_key)
+                    comp_google = google_place_details(pid, google_key) if pid else {"error": "Google textsearch failed"}
+                    st.session_state[f"comp_google_{i}"] = comp_google
+
+                    if yelp_key:
+                        ysr = yelp_search_business(comp_name, formatted_address, yelp_key, limit=3)
+                        best = None
+                        if isinstance(ysr, dict) and ysr.get("businesses"):
+                            best = ysr["businesses"][0]
+                            rid = best.get("id")
+                            rev = yelp_get_reviews(rid, yelp_key) if rid else {}
+                            comp_yelp = {"best_match": best, "reviews": rev}
+                        else:
+                            comp_yelp = {"error": "No Yelp match", "raw": ysr}
+                    else:
+                        comp_yelp = {"note": "YELP_API_KEY not configured"}
+                    st.session_state[f"comp_yelp_{i}"] = comp_yelp
+
+                comp_summary_rows.append({
+                    "competitor": comp_name.strip(),
+                    "google_rating": comp_google.get("rating", "") if isinstance(comp_google, dict) else "",
+                    "google_reviews": comp_google.get("user_ratings_total", "") if isinstance(comp_google, dict) else "",
+                    "yelp_rating": (comp_yelp.get("best_match", {}) or {}).get("rating", "") if isinstance(comp_yelp, dict) else "",
+                    "yelp_reviews": (comp_yelp.get("best_match", {}) or {}).get("review_count", "") if isinstance(comp_yelp, dict) else "",
+                    "menus_uploaded": 0 if not comp_menu_files else len(comp_menu_files),
+                })
+
+                comp_inputs.append(
+                    CompetitorInput(
+                        name_or_address=comp_name.strip(),
+                        notes=comp_notes.strip(),
+                        menu_files_meta={"label": f"COMP_{i+1}", "files": [{"name": f.name} for f in (comp_menu_files or [])],
+                                         "extracted": {"items": [], "promos": [], "notes": []}},
+                        google=comp_google if isinstance(comp_google, dict) else {},
+                        yelp=comp_yelp if isinstance(comp_yelp, dict) else {},
+                    )
                 )
+
+        if comp_summary_rows:
+            st.dataframe(pd.DataFrame(comp_summary_rows), use_container_width=True)
+
+        # Orders
+        with st.expander("上传订单报表（CSV，可选：用于时段/客单/热销/KPI）", expanded=False):
+            order_files = st.file_uploader("上传平台订单导出 CSV（可多选）", type=["csv"], accept_multiple_files=True, key="report_order_files")
+            orders_meta = summarize_orders(order_files or [])
+            if order_files:
+                st.json(orders_meta)
+
+        if "orders_meta" not in locals():
+            orders_meta = {"files": [], "note": "No uploads"}
+
+        # Step 3
+        st.subheader("Step 3｜生成深度分析报告（含可视化图表 + 可执行动作展开）")
+
+        if st.button("生成报告内容", type="primary", disabled=not openai_key, key="btn_generate_report"):
+            progress = st.progress(0)
+            status = st.empty()
+
+            def step(pct: int, msg: str):
+                progress.progress(pct)
+                status.info(msg)
+
+            report_date = dt.datetime.now().strftime("%m/%d/%Y")
+
+            step(5, "正在解析门店菜单（识别菜品/价格/促销）...")
+            own_menu_meta = extract_menu_with_openai(own_menu_files or [], openai_key, model, label="OWN_MENU")
+
+            step(25, "正在解析竞对菜单（逐个识别菜品/价格/促销）...")
+            competitors_full: List[CompetitorInput] = []
+            for i in range(st.session_state.comp_rows):
+                comp_name = st.session_state.get(f"comp_name_{i}", "").strip()
+                comp_notes = st.session_state.get(f"comp_notes_{i}", "").strip()
+                comp_google = st.session_state.get(f"comp_google_{i}", {}) or {}
+                comp_yelp = st.session_state.get(f"comp_yelp_{i}", {}) or {}
+                comp_files = st.session_state.get(f"comp_menu_files_{i}", None)
+
+                if comp_files and isinstance(comp_files, list) and len(comp_files) > 0:
+                    comp_menu_meta = extract_menu_with_openai(comp_files, openai_key, model, label=f"COMP_{i+1}")
+                else:
+                    comp_menu_meta = {"label": f"COMP_{i+1}", "files": [], "extracted": {"items": [], "promos": [], "notes": ["no competitor menu uploaded"]}}
+
+                competitors_full.append(CompetitorInput(
+                    name_or_address=comp_name,
+                    notes=comp_notes,
+                    menu_files_meta=comp_menu_meta,
+                    google=comp_google,
+                    yelp=comp_yelp
+                ))
+
+            step(45, "正在生成菜单可视化图表（价格分布/品类结构/价格带/竞对对比）...")
+            own_df = menu_to_df(own_menu_meta)
+            comp_dfs = []
+            for c in competitors_full:
+                dfc = menu_to_df(c.menu_files_meta)
+                comp_dfs.append((c.name_or_address or c.menu_files_meta.get("label", "Competitor"), dfc))
+            charts = build_charts(own_df, comp_dfs)
+
+            step(60, "正在生成咨询级报告（含：买一送一具体菜品、季节性上新、动作清单展开）...")
+            tract_info = st.session_state.get("tract_info", None)
+            acs_data = st.session_state.get("acs_data", None)
+
+            inputs = ReportInputs(
+                report_date=report_date,
+                restaurant_cn=(restaurant_cn.strip() or restaurant_en.strip()),
+                restaurant_en=restaurant_en.strip(),
+                address=formatted_address.strip(),
+                radius_miles=radius_miles,
+                own_menu_meta=own_menu_meta,
+                orders_meta=orders_meta,
+                competitors=competitors_full,
+                extra_business_context=extra_context.strip(),
+                acs=acs_data,
+                tract_info=tract_info,
+                restaurant_google=place_details,
+                charts=charts,
             )
 
-    if comp_summary_rows:
-        st.dataframe(pd.DataFrame(comp_summary_rows), use_container_width=True)
+            prompt = build_prompt(inputs)
 
-    # Orders
-    with st.expander("上传订单报表（CSV，可选：用于时段/客单/热销/KPI）", expanded=False):
-        order_files = st.file_uploader("上传平台订单导出 CSV（可多选）", type=["csv"], accept_multiple_files=True)
-        orders_meta = summarize_orders(order_files or [])
-        if order_files:
-            st.json(orders_meta)
+            report_text = openai_text(prompt, openai_key, model=model, temperature=0.25)
+            report_text = sanitize_text(report_text)
 
-    if "orders_meta" not in locals():
-        orders_meta = {"files": [], "note": "No uploads"}
+            step(80, "正在自动扩写（确保足够长、足够细、能落地执行）...")
+            report_text = ensure_long_enough(report_text, openai_key, model=model, min_chars=16000)
 
-    # Step 3
-    st.subheader("Step 3｜生成深度分析报告（含可视化图表 + 可执行动作展开）")
+            step(95, "正在完成渲染准备（可编辑预览 + PDF）...")
+            st.session_state["report_text"] = report_text
+            st.session_state["report_inputs"] = inputs
 
-    if st.button("生成报告内容", type="primary", disabled=not openai_key):
-        progress = st.progress(0)
-        status = st.empty()
+            step(100, "完成：报告内容已生成。你可以预览编辑并输出 PDF。")
+            status.success("报告内容已生成（包含图表页与更完整的第6章定价/促销深度分析）。")
 
-        def step(pct: int, msg: str):
-            progress.progress(pct)
-            status.info(msg)
+    # Preview + PDF
+    report_text = st.session_state.get("report_text", "")
+    report_inputs: Optional[ReportInputs] = st.session_state.get("report_inputs", None)
 
-        report_date = dt.datetime.now().strftime("%m/%d/%Y")
+    if report_text and report_inputs:
+        st.subheader("预览（可编辑）")
+        edited = st.text_area("报告正文（你可以直接修改）", value=report_text, height=520, key="report_editor")
+        st.session_state["report_text"] = sanitize_text(edited)
 
-        # 1) Parse own menu
-        step(5, "正在解析门店菜单（识别菜品/价格/促销）...")
-        own_menu_meta = extract_menu_with_openai(own_menu_files or [], openai_key, model, label="OWN_MENU")
-
-        # 2) Parse competitors menus
-        step(25, "正在解析竞对菜单（逐个识别菜品/价格/促销）...")
-        competitors_full: List[CompetitorInput] = []
-        for i in range(st.session_state.comp_rows):
-            comp_name = st.session_state.get(f"comp_name_{i}", "").strip()
-            comp_notes = st.session_state.get(f"comp_notes_{i}", "").strip()
-            comp_google = st.session_state.get(f"comp_google_{i}", {}) or {}
-            comp_yelp = st.session_state.get(f"comp_yelp_{i}", {}) or {}
-            comp_files = st.session_state.get(f"comp_menu_files_{i}", None)
-
-            if comp_files and isinstance(comp_files, list) and len(comp_files) > 0:
-                comp_menu_meta = extract_menu_with_openai(comp_files, openai_key, model, label=f"COMP_{i+1}")
-            else:
-                comp_menu_meta = {"label": f"COMP_{i+1}", "files": [], "extracted": {"items": [], "promos": [], "notes": ["no competitor menu uploaded"]}}
-
-            competitors_full.append(CompetitorInput(
-                name_or_address=comp_name,
-                notes=comp_notes,
-                menu_files_meta=comp_menu_meta,
-                google=comp_google,
-                yelp=comp_yelp
-            ))
-
-        # 3) Build charts
-        step(45, "正在生成菜单可视化图表（价格分布/品类结构/价格带/竞对对比）...")
-        own_df = menu_to_df(own_menu_meta)
-        comp_dfs = []
-        for c in competitors_full:
-            dfc = menu_to_df(c.menu_files_meta)
-            comp_dfs.append((c.name_or_address or c.menu_files_meta.get("label", "Competitor"), dfc))
-        charts = build_charts(own_df, comp_dfs)
-
-        # 4) Prompt
-        step(60, "正在生成咨询级报告（含：买一送一具体菜品、季节性上新、动作清单展开）...")
-        tract_info = st.session_state.get("tract_info", None)
-        acs_data = st.session_state.get("acs_data", None)
-
-        inputs = ReportInputs(
-            report_date=report_date,
-            restaurant_cn=(restaurant_cn.strip() or restaurant_en.strip()),
-            restaurant_en=restaurant_en.strip(),
-            address=formatted_address.strip(),
-            radius_miles=radius_miles,
-            own_menu_meta=own_menu_meta,
-            orders_meta=orders_meta,
-            competitors=competitors_full,
-            extra_business_context=extra_context.strip(),
-            acs=acs_data,
-            tract_info=tract_info,
-            restaurant_google=place_details,
-            charts=charts,
-        )
-
-        prompt = build_prompt(inputs)
-
-        report_text = openai_text(prompt, openai_key, model=model, temperature=0.25)
-        report_text = sanitize_text(report_text)
-
-        # 5) Auto expand (ensure 6-7 pages)
-        step(80, "正在自动扩写（确保足够长、足够细、能落地执行）...")
-        report_text = ensure_long_enough(report_text, openai_key, model=model, min_chars=16000)
-
-        # 6) Done
-        step(95, "正在完成渲染准备（可编辑预览 + PDF）...")
-        st.session_state["report_text"] = report_text
-        st.session_state["report_inputs"] = inputs
-
-        step(100, "完成：报告内容已生成。你可以预览编辑并输出 PDF。")
-        status.success("报告内容已生成（包含图表页与更完整的第6章定价/促销深度分析）。")
-
-# =========================================================
-# Preview + PDF
-# =========================================================
-report_text = st.session_state.get("report_text", "")
-report_inputs: Optional[ReportInputs] = st.session_state.get("report_inputs", None)
-
-if report_text and report_inputs:
-    st.subheader("预览（可编辑）")
-    edited = st.text_area("报告正文（你可以直接修改）", value=report_text, height=520)
-    st.session_state["report_text"] = sanitize_text(edited)
-
-    # Show chart previews in UI (icons-like data blocks)
-    st.subheader("图表预览（将自动附在 PDF 后面）")
-    if report_inputs.charts:
-        cols = st.columns(2)
-        i = 0
-        for k, v in charts.items():
-            if isinstance(v, str) and os.path.exists(v):
+        st.subheader("图表预览（将自动附在 PDF 后面）")
+        if report_inputs.charts:
+            for k, v in report_inputs.charts.items():
+                st.markdown(f"**{k}**")
                 st.image(v, use_container_width=True)
-            else:
-                st.warning(f"Chart {k} 未生成图片，已跳过")
-            i += 1
-    else:
-        st.info("暂无图表（通常是菜单价格识别不足导致 price 缺失）。")
+        else:
+            st.info("暂无图表（通常是菜单价格识别不足导致 price 缺失）。")
 
-    st.subheader("Step 4｜生成 PDF（含图表页）")
-    if st.button("生成 PDF", type="primary"):
-        with st.spinner("正在生成 PDF..."):
-            pdf_path = render_pdf(st.session_state["report_text"], report_inputs)
-        st.success("PDF 生成完成。")
-        with open(pdf_path, "rb") as f:
-            st.download_button("下载 PDF", f, file_name=os.path.basename(pdf_path), mime="application/pdf")
-        st.caption(f"输出路径：{pdf_path}")
-else:
-    st.info("完成餐厅选择 → 上传菜单/竞对 → 生成报告后，这里会显示预览与 PDF 下载。")
+        st.subheader("Step 4｜生成 PDF（含图表页）")
+        if st.button("生成 PDF", type="primary", key="btn_make_pdf"):
+            with st.spinner("正在生成 PDF..."):
+                pdf_path = render_pdf(st.session_state["report_text"], report_inputs)
+            st.success("PDF 生成完成。")
+            with open(pdf_path, "rb") as f:
+                st.download_button("下载 PDF", f, file_name=os.path.basename(pdf_path), mime="application/pdf", key="btn_dl_pdf")
+            st.caption(f"输出路径：{pdf_path}")
+    else:
+        st.info("完成餐厅选择 → 上传菜单/竞对 → 生成报告后，这里会显示预览与 PDF 下载。")
+
+
+# =========================================================
+# TAB 2: MENU SMART ADJUST (NEW)
+# =========================================================
+with tab_menu:
+    st.subheader("菜单智能调整（按你要求的 Step C）")
+    st.caption("逻辑：上传菜单 → AI识别 → 判断“套餐不足/整体偏贵” → 先调价 → 再组套餐 → 输出完整菜单结构（可下载CSV/JSON）。")
+
+    st.divider()
+
+    colL, colR = st.columns([2, 1], gap="large")
+    with colR:
+        st.markdown("### 参数")
+        location = st.text_input("门店/商圈位置（用于同行价带估算）", value="San Francisco Bay Area", key="menu_location")
+        cuisine = st.text_input("菜系/定位（用于同行价带估算）", value="港式/东南亚/中餐外卖", key="menu_cuisine")
+        target_median = st.number_input("目标主食中位价（偏高判定基准）", value=float(DEFAULT_TARGET_MEDIAN_MAIN), step=0.5, key="menu_target_median")
+        high_ratio = st.number_input("偏高阈值倍率（当前中位数 > 目标*倍率）", value=float(HIGH_PRICE_THRESHOLD_RATIO), step=0.01, key="menu_high_ratio")
+        min_combos = st.number_input("最低套餐数量（不足则自动组建）", value=int(MIN_COMBOS_REQUIRED), step=1, key="menu_min_combos")
+        front_limit = st.number_input("前台建议 SKU 上限（参考）", value=int(FRONT_LIMIT), step=1, key="menu_front_limit")
+        st.caption("说明：你没上传竞品菜单也能跑。同行价带由 AI 估算；若 AI 失败，至少能按目标中位数做规则回调。")
+
+    with colL:
+        st.markdown("### 上传菜单（图片/CSV/Excel）")
+        menu_files = st.file_uploader(
+            "上传菜单文件（png/jpg/txt/csv/xlsx，支持多文件）",
+            type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
+            accept_multiple_files=True,
+            key="smart_menu_files"
+        )
+        st.caption("建议：上传“平台菜单页截图”比“后台列表截图”更好识别。后台列表截图也能用，但缺口会多一些。")
+
+        run_smart = st.button("🚀 开始智能调整并生成完整菜单", type="primary", disabled=not openai_key, key="btn_run_smart_menu")
+
+    if run_smart:
+        prog = st.progress(0)
+        stat = st.empty()
+
+        def step(p, msg):
+            prog.progress(p)
+            stat.info(msg)
+
+        # Step A: Extract
+        step(10, "正在解析菜单（识别菜品/价格/分类/套餐线索）...")
+        menu_meta = extract_menu_with_openai(menu_files or [], openai_key, model, label="SMART_MENU")
+        items = normalize_extracted_items(menu_meta)
+
+        if not items:
+            st.error("未识别到任何菜品。建议换更清晰的菜单图片，或上传 CSV/Excel。")
+            st.stop()
+
+        typed0 = split_by_type(items)
+        mains0 = [m for m in typed0["main"] if isinstance(m.get("price"), (int, float)) and m["price"] and m["price"] > 0]
+        combos0 = typed0["combo"]
+
+        step(25, "Step C：检查套餐 & 检查整体价格是否偏高（同行价带估算）...")
+
+        # Step C-1: overpriced check (rule)
+        overpriced, cur_med = is_menu_overpriced(mains0, float(target_median), float(high_ratio)) if mains0 else (False, None)
+
+        meta = {
+            "current_median_main": cur_med,
+            "target_median_main": float(target_median),
+            "overpriced_by_rule": overpriced,
+            "combo_count_detected": len(combos0),
+        }
+
+        # Step C-2: If overpriced -> first adjust prices (AI first, fallback rule)
+        adjusted_items = items
+        ai_meta = {}
+        if overpriced:
+            step(40, "检测到整体偏贵：先进行 AI 同行价带校准（失败则规则缩放回调）...")
+            adjusted_items_ai, ai_meta = ai_market_benchmark(
+                items=items,
+                location=location,
+                cuisine=cuisine,
+                target_median_main=float(target_median),
+                api_key=openai_key,
+                model=model
+            )
+
+            # If AI provides usable adjustment, apply it; else fallback to rule scaling
+            if ai_meta and not ai_meta.get("ai_error"):
+                adjusted_items = adjusted_items_ai
+                meta["price_adjustment_mode"] = "ai_market_benchmark"
+                meta["ai_market_meta"] = ai_meta
+            else:
+                # fallback: scale to target median
+                if cur_med and cur_med > 0:
+                    scale = float(target_median) / float(cur_med)
+                    adjusted_items = scale_prices(items, scale=scale)
+                    meta["price_adjustment_mode"] = "rule_scale"
+                    meta["rule_scale"] = round(scale, 4)
+                meta["ai_market_meta"] = ai_meta
+
+        # Step C-3: If combo missing -> build combos AFTER pricing adjusted
+        typed1 = split_by_type(adjusted_items)
+        combos1 = typed1["combo"]
+        combo_ok = detect_combo_system(combos1, int(min_combos))
+
+        if not combo_ok:
+            step(65, f"套餐不足（当前 {len(combos1)} < {int(min_combos)}）：先调价已完成 → 现在自动组建套餐...")
+            adjusted_items, combo_meta = build_combos_if_missing(
+                items=adjusted_items,
+                location=location,
+                cuisine=cuisine,
+                api_key=openai_key,
+                model=model
+            )
+            meta["combo_build_meta"] = combo_meta
+        else:
+            meta["combo_build_meta"] = {"note": "combos sufficient"}
+
+        # Step Final: Build final menu
+        step(85, "正在生成完整菜单结构（锚点/爆品/套餐/加购/饮品/隐藏层）...")
+        final_menu = build_smart_menu(adjusted_items, front_limit=int(front_limit))
+        flat_df = menu_to_flat_df(final_menu)
+
+        step(100, "完成：已生成完整菜单结构。")
+
+        st.success("✅ 菜单智能调整完成（按 Step C：先调价 → 再组套餐 → 输出完整菜单）")
+        st.write(meta)
+
+        st.divider()
+        st.markdown("## 最终菜单结构预览")
+        for section, lst in final_menu.items():
+            st.markdown(f"### {section}（{len(lst)}）")
+            for it in lst[:80]:
+                nm = item_fullname(it)
+                p = it.get("price")
+                po = it.get("price_old", None)
+                if isinstance(po, (int, float)) and isinstance(p, (int, float)) and po != p:
+                    st.write(f"- {nm} — ${p:.2f}（原价 ${po:.2f}）")
+                elif isinstance(p, (int, float)):
+                    st.write(f"- {nm} — ${p:.2f}")
+                else:
+                    st.write(f"- {nm} — 价格缺失")
+
+            if len(lst) > 80:
+                st.caption(f"（此处仅预览前 80 项，完整请下载 CSV/JSON）")
+
+        st.divider()
+        st.markdown("## 下载")
+        menu_json = json.dumps(final_menu, ensure_ascii=False, indent=2)
+        st.download_button("下载菜单结构 JSON", data=menu_json, file_name="smart_menu.json", mime="application/json", key="dl_smart_json")
+
+        st.dataframe(flat_df, use_container_width=True, height=520)
+        st.download_button("下载菜单结构 CSV", data=flat_df.to_csv(index=False), file_name="smart_menu.csv", mime="text/csv", key="dl_smart_csv")
