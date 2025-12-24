@@ -219,6 +219,91 @@ def wrap_lines_by_chars(text: str, max_chars: int) -> List[str]:
         lines.extend(textwrap.wrap(para, width=max_chars, break_long_words=False, replace_whitespace=False))
     return lines
 
+def wrap_lines_by_pdf_width(text: str, font_name: str, font_size: int, max_width: float) -> List[str]:
+    """
+    Wrap text to fit PDF width using reportlab stringWidth.
+    - English: prefer space wrapping, but will hard-break very long tokens (urls/long words).
+    - Chinese/No-space lines: char-by-char safe wrapping.
+    """
+    out: List[str] = []
+    if not text:
+        return out
+
+    def _string_w(s: str) -> float:
+        try:
+            return pdfmetrics.stringWidth(s, font_name, font_size)
+        except Exception:
+            return len(s) * font_size * 0.55
+
+    def _hard_break_token(token: str) -> List[str]:
+        cur = ""
+        lines = []
+        for ch in token:
+            cand = cur + ch
+            if _string_w(cand) <= max_width:
+                cur = cand
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = ch
+        if cur:
+            lines.append(cur)
+        return lines
+
+    def _wrap_one_line(line: str) -> List[str]:
+        line = line.rstrip("\n")
+        if not line.strip():
+            return [""]
+
+        if _string_w(line) <= max_width:
+            return [line]
+
+        if " " in line:
+            words = line.split(" ")
+            cur = ""
+            lines = []
+            for w in words:
+                candidate = (cur + " " + w).strip() if cur else w
+                if _string_w(candidate) <= max_width:
+                    cur = candidate
+                else:
+                    if cur:
+                        lines.append(cur)
+                        cur = w
+                    else:
+                        lines.extend(_hard_break_token(w))
+                        cur = ""
+            if cur:
+                lines.append(cur)
+            return lines
+
+        # no spaces -> char wrap
+        chars = list(line)
+        cur = ""
+        lines = []
+        for ch in chars:
+            candidate = cur + ch
+            if _string_w(candidate) <= max_width:
+                cur = candidate
+            else:
+                if cur:
+                    lines.append(cur)
+                    cur = ch
+                else:
+                    lines.append(ch)
+                    cur = ""
+        if cur:
+            lines.append(cur)
+        return lines
+
+    for para in text.splitlines():
+        if not para.strip():
+            out.append("")
+            continue
+        out.extend(_wrap_one_line(para))
+
+    return out
+
 def parse_sections(text: str) -> List[Tuple[str, str]]:
     text = text.strip()
     if not text:
@@ -232,7 +317,7 @@ def parse_sections(text: str) -> List[Tuple[str, str]]:
         if cur_title is not None:
             sections.append((cur_title.strip(), "\n".join(cur_body).strip()))
         cur_title = None
-        cur_body[:] = []
+        cur_body = []
 
     for ln in text.splitlines():
         ln_stripped = ln.strip()
@@ -269,10 +354,10 @@ def google_geocode(address: str, api_key: str) -> Optional[Tuple[float, float]]:
     loc = data["results"][0]["geometry"]["location"]
     return float(loc["lat"]), float(loc["lng"])
 
-def google_nearby_restaurants(lat: float, lng: float, api_key: str, radius_m: int = 1200) -> List[Dict[str, Any]]:
+def google_nearby_places(lat: float, lng: float, api_key: str, radius_m: int = 1200, place_type: str = "restaurant") -> List[Dict[str, Any]]:
     url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
     results: List[Dict[str, Any]] = []
-    params = {"location": f"{lat},{lng}", "radius": radius_m, "type": "restaurant", "key": api_key}
+    params = {"location": f"{lat},{lng}", "radius": radius_m, "type": place_type, "key": api_key}
     for _ in range(3):
         r = requests.get(url, params=params, timeout=30)
         r.raise_for_status()
@@ -285,44 +370,12 @@ def google_nearby_restaurants(lat: float, lng: float, api_key: str, radius_m: in
             break
         time.sleep(2)
         params = {"pagetoken": token, "key": api_key}
-    return results
-
-def google_nearby_places(lat: float, lng: float, api_key: str, radius_m: int = 1200,
-                         place_type: Optional[str] = None,
-                         keyword: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Google Places Nearby Search (generic).
-    - place_type: e.g. "beauty_salon", "spa", "hair_care", "restaurant"
-    - keyword: e.g. "head spa", "scalp", "massage"
-    """
-    url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-    results: List[Dict[str, Any]] = []
-
-    params = {"location": f"{lat},{lng}", "radius": radius_m, "key": api_key}
-    if place_type:
-        params["type"] = place_type
-    if keyword:
-        params["keyword"] = keyword
-
-    for _ in range(3):
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("status") not in ("OK", "ZERO_RESULTS"):
-            break
-        results.extend(data.get("results", []))
-        token = data.get("next_page_token")
-        if not token:
-            break
-        time.sleep(2)
-        params = {"pagetoken": token, "key": api_key}
-
     return results
 
 def google_place_details(place_id: str, api_key: str) -> Dict[str, Any]:
     url = "https://maps.googleapis.com/maps/api/place/details/json"
     fields = ",".join([
-        "place_id","name","formatted_address","rating","user_ratings_total","types",
+        "name","formatted_address","rating","user_ratings_total","types",
         "url","website","formatted_phone_number","opening_hours","reviews","geometry"
     ])
     r = requests.get(url, params={"place_id": place_id, "fields": fields, "key": api_key}, timeout=30)
@@ -838,8 +891,84 @@ def summarize_orders(files: List[Any]) -> Dict[str, Any]:
 
 
 # =========================================================
-# Prompt (report) + language switch
+# Prompt (餐饮业态分析报告) + language switch
 # =========================================================
+RESTAURANT_SYSTEM_STYLE = """
+你是一个餐饮行业的数据驱动增长咨询顾问，擅长对餐饮门店与餐饮品牌进行商圈诊断、平台与堂食结构分析、菜单与价格优化、虚拟品牌设计，并输出可落地执行的增长方案。报告风格参考专业餐饮咨询公司的 trade area & growth diagnostic 报告，有深度、有数据支撑，并给出具体、可拆解的执行步骤与 KPI。
+
+请严格围绕「餐饮门店/餐饮品牌」输出报告，按照以下结构与逻辑编写（可调整小标题措辞，但保留模块和思路）：
+
+0. 报告基本信息与摘要（Executive Summary）
+- 说明：门店/品牌名称、地址或城市、业态（如：港式茶餐厅、中餐快餐、火锅、咖啡馆、甜品、轻食等）、主要就餐场景（堂食/外卖/自提比例）。
+- 用 3–6 句给出高层摘要：
+  - 所处商圈类型：例如“稳定型社区商圈”“办公室/商务型商圈”“学校/学生型商圈”“景区/高流动商圈”等。
+  - 1–3 个结构性优势（如：老字号品牌资产、多平台覆盖、厨房产能充足等）。
+  - 1–3 个关键问题/增长瓶颈（如：线上结构未最大化、价格带与客群错位、某时段空档严重等）。
+
+1. 商圈与客群结构（Trade Area & Demand Fundamentals）
+1.1 商圈界定与人口结构
+- 说明门店核心商圈半径（例如：社区店 3–4 英里，商圈步行 10–15 分钟等），并结合可用信息描述：
+  - 常住人口大致区间；
+  - 族裔结构、年龄层分布；
+  - 家庭住户占比 vs 单身/学生占比；
+  - 人口流动性（低/中/高）及其原因。
+1.2 餐饮消费行为特征
+- 判断：该商圈是高流量即食型（路过客流为主），还是信任驱动型（熟客复购为主），或者混合型。说明判断依据。
+- 说明影响复购的关键变量：例如品牌经营年限、出品稳定性、口味正宗度、家庭适配度、价格敏感度等。
+- 要求：每个判断后，用 1–2 句说明“哪些数据或事实支撑这个判断”，而不是空泛描述。
+
+2. 门店与品牌资产结构（Store & Brand Assets）
+2.1 门店基本盘
+- 门店开业年限、历史定位（如：社区老字号、新概念品牌、网红店等）。
+- 当前客源构成：附近居民、周边公司白领、学生、游客等的大致比例。
+2.2 品牌信任与复购结构
+- 说明：在核心客群中的信任度与口碑特征，是“老字号高信任高复购”，还是“新店处于试错期”。
+- 判断该门店处于哪个阶段：
+  - “结构正确但效率未最大化”；
+  - “新店需要快速验证定位与客群”；
+  - “老品牌线上化/多平台化转型期”。
+
+3. 渠道与平台生态（Dine-in, Takeout & Platform Ecosystem）
+3.1 渠道构成概览
+- 拆解：堂食；自提（电话/官网/Google）；第三方外卖平台（DoorDash/UberEats/Grubhub/饭团/HungryPanda 等）。
+- 对每个渠道给出：订单占比大致区间、人均消费估计、典型用户类型与消费动机。
+3.2 平台角色拆解（Role-based View）
+- 对每一个平台说明：商圈特征+平台主要客群；用户动机；战略意义（利润锚点/新客入口/订单基盘/活跃度来源）。
+- 强调：“多平台结构不是分散，而是分工”。给出判断：当前结构是“基础结构正确但效率未最大化”还是“过度依赖单一平台存在风险”。
+
+4. 竞争格局与相对位置（Competitive Landscape）
+4.1 竞品选择与对比
+- 选出 3–5 家主要竞品（同品类、同价格带、同平台、同商圈）。
+- 用表格对比：经营年限、平台覆盖、品牌信任资产、用户结构、价格带与主打菜、核心风险点。
+4.2 关键洞察
+- 说明竞争本质不在“菜系”，而在“平台结构与运营结构是否更优”。明确本店优势与短板各 2–3 条。
+
+5. 价格带与订单经济（Pricing & Order Economics）
+5.1 有效成交价格带：总结高频薄利区/主流成交区/高价可接受但需价值支撑/过高阻力区。
+5.2 价格敏感机制：强调价格变化的“解释空间”。
+5.3 优化方向：主攻区间、引流/高毛利/套餐化菜品、平台差异化标价策略。
+
+6. 时段与场景需求结构（Time-based & Occasion-based Demand）
+6.1 时段贡献：早餐/午餐/下午茶/晚餐/夜宵，订单与收入贡献、客单差异、用户类型差异。
+6.2 场景适配：工作日vs周末、堂食vs外卖、自提vs平台；识别放量场景/利润场景/获客心智场景。
+
+7. 菜单架构与虚拟品牌策略（Menu Architecture & Virtual Brand）
+7.1 平台区分菜单架构：不同平台不能完全同菜单；给出 SKU 数量、主打品类、活动策略、定价策略建议。
+7.2 虚拟品牌/子品牌：给 1–2 个方向；明确平台优先级、核心菜品组合与价格带、与主品牌区隔逻辑。
+7.3 虚拟品牌 KPI：订单占比、新客占比、对主品牌干扰、差评机制的纠偏动作。
+
+8. 战略结论与执行路线图（Strategic Implications & Execution Roadmap）
+8.1 关键战略判断：3–6 条有力度判断句。
+8.2 3–5 条核心增长举措：适用对象、动作内容、量化目标（转化/客单/时段收入占比/平台占比调整）。
+8.3 执行节奏与监测机制：3–6 个月节奏；平台漏斗、品类结构、时段结构；预警信号与触发调整。
+
+输出风格要求
+- 必须分章节分小节，结构类似专业「门店分析 & 增长诊断」报告。
+- 多用表格展示：平台角色对比、竞品结构对比、价格带 vs 成交表现、时段 vs 收入贡献。
+- 语言：简洁、有判断力，少空洞形容词；多用“结构/分工/分层/杠杆/解释空间/订单基盘/利润锚点/存在感”等术语。
+- 所有建议尽量落到可执行细节：谁执行、在哪个平台/时段执行、做什么动作、期望看到哪些数据变化。
+""".strip()
+
 def build_prompt(inputs: ReportInputs, lang: str) -> str:
     blob = {
         "report_date": inputs.report_date,
@@ -877,109 +1006,24 @@ def build_prompt(inputs: ReportInputs, lang: str) -> str:
         lang_rule = "输出语言必须是中文（简体），除非专有名词/菜名需要英文。"
 
     return f"""
+{RESTAURANT_SYSTEM_STYLE}
+
 You are AuraInsight's restaurant growth consultant.
 {lang_rule}
 
 Hard requirements:
 1) Do NOT output Markdown.
-2) Headings must be numbered "1. ...".
-3) Each chapter starts with 3-6 Key Takeaways.
+2) Headings must be numbered like "0. ...", "1. ...", "1.1 ...".
+3) Each major chapter starts with 3-6 Key Takeaways.
 4) Every recommendation must include: Action, Reason, Expected Impact, KPI, 2-week Validation method.
-5) Chapter 6 must be extremely detailed (pricing anchors, discounts, BOGO, bundles).
-6) Must interpret charts by name (chart_own_price_hist, chart_own_category_bar, chart_own_price_tiers, chart_comp_median_price).
-7) Must include Data Gaps & How to Collect.
-
-Output chapter order:
-1. Executive Summary
-2. Trade Area & Demographics
-3. Customer Segments & JTBD
-4. Demand, Occasion & Menu Positioning
-5. Competitive Landscape (Google + Yelp + Menu)
-6. Pricing, Anchors & Promo Economics
-7. Menu Architecture & Menu Engineering
-8. Platform Growth Playbook (30/60/90)
-9. Measurement System & Experiment Design
-10. Appendix A: Own Menu Deep Dive
-11. Appendix B: Competitor Menu Deep Dive
-12. Data Gaps & How to Collect
+5) Must interpret charts by name (chart_own_price_hist, chart_own_category_bar, chart_own_price_tiers, chart_comp_median_price) when available.
+6) Must include Data Gaps & How to Collect (as an explicit section).
+7) Must include tables where appropriate (use plain text tables, not Markdown).
 
 Input JSON:
 {json.dumps(blob, ensure_ascii=False, indent=2)}
 
 Start writing now:
-""".strip()
-
-def build_quick_diag_prompt(
-    business_name: str,
-    address: str,
-    place_details: Dict[str, Any],
-    acs_data: Optional[Dict[str, Any]],
-    tract_info: Optional[Dict[str, Any]],
-    competitors: List[Dict[str, Any]],
-    lang: str,
-) -> str:
-    """
-    Generate a short, client-deliverable quick diagnostic.
-    Must NOT look machine-written: decisive, specific, no fluff, no 'AI', no buzzwords.
-    """
-    blob = {
-        "business": {
-            "name": business_name,
-            "address": address,
-            "google": place_details,
-        },
-        "trade_area_proxy": {
-            "tract_info": tract_info,
-            "acs": acs_data,
-            "note": "ACS 为 tract 级别代理，仅作为方向性参考。"
-        },
-        "nearby_competitors_sample": competitors[:12],
-        "generated_at": dt.datetime.now().strftime("%Y-%m-%d"),
-        "region_context": "San Francisco Bay Area / Peninsula (e.g., San Bruno, South SF, Millbrae)",
-    }
-
-    if lang == "English":
-        lang_rule = "Output language MUST be English."
-    else:
-        lang_rule = "输出语言必须是中文（简体），必要的专有名词保留英文。"
-
-    return f"""
-You are AuraInsight's field operator (not a professor).
-{lang_rule}
-
-Write a QUICK DIAGNOSTIC that reads like a human operator wrote it after scanning the local market.
-Hard rules:
-- DO NOT output Markdown.
-- DO NOT mention AI, models, prompts, or 'data analysis shows'.
-- Keep it short and sharp: ~700 to 1200 Chinese chars (or ~450 to 800 English words).
-- Use confident, specific language. No vague hedging like 'maybe', 'could be'.
-- Use local context (Peninsula / San Bruno / South SF consumer behavior).
-- Use ONLY the input JSON facts; if something is missing, call it out plainly as '信息缺口'.
-- Headings must use bracket style: 【...】 (so PDF parser can split sections).
-- The report must contain exactly these sections in order:
-
-【快速诊断报告｜一句话判决】
-1–2 sentences. Direct.
-
-【三处最可能在“漏钱/漏复购”的点】
-Exactly 3 bullets. Each bullet must be specific and operational (not generic).
-
-【一个7天内能验证的小动作】
-One action only. Include:
-- 怎么做（步骤化 3-5 行）
-- 预期变化（具体）
-- KPI（1-2 个）
-
-【你现在最不该做的两件事】
-Exactly 2 bullets. Must be realistic.
-
-【信息缺口（如果你愿意，我们下一步补齐）】
-List missing info that would make diagnosis stronger (max 6 lines).
-
-Input JSON:
-{json.dumps(blob, ensure_ascii=False, indent=2)}
-
-Start writing now.
 """.strip()
 
 def ensure_long_enough(report_text: str, api_key: str, model: str, lang: str, min_chars: int = 16000) -> str:
@@ -1014,6 +1058,119 @@ Original:
 
 
 # =========================================================
+# Prompt (多业态快速诊断报告)
+# =========================================================
+MULTI_SYSTEM_STYLE = """
+你是一个数据驱动的商业分析与增长咨询顾问，擅长把定性洞察和定量数据结合，输出结构清晰、逻辑严谨、可执行的业务诊断与增长方案报告。报告风格参考专业咨询公司（如 trade area & growth diagnostic 形式），要求有深度、有数据支撑、有清晰的执行路径和量化目标。
+
+请按以下原则和结构输出报告（可根据业务类型微调章节标题，但必须保留这些逻辑模块）：
+
+0. 报告基本信息
+- 简要说明：业务名称、行业/品类、所在城市/区域、分析时间范围。
+- 用 3–5 句给出高层摘要（Executive Summary）：
+  - 当前业务所处的结构性位置（例如：稳定型社区商圈、高流动商旅型、线上获客型、平台依赖型等）。
+  - 1–3 个关键结构性优势。
+  - 1–3 个关键增长瓶颈。
+
+1. 需求与客群结构（Trade Area / Customer Fundamentals）
+1.1 区域/目标客群画像
+- 结合可用数据描述目标客群，使用“区间 + 相对占比”表达。
+1.2 消费/使用行为特征
+- 判断业务属于：高流量冲动型/低流动高复购型/项目制决策型/长期合同型等。
+- 每个判断后必须给出 1–2 句支撑依据（数据或事实），写出因果逻辑。
+
+2. 品牌与渠道/平台结构（Brand & Channel Ecosystem）
+2.1 品牌资产与信任结构：经营年限、认知度、口碑、复购/续约趋势；判断阶段（新品牌试错/老品牌效率优化）。
+2.2 渠道/平台角色拆解（Role-based View）
+- 列出主要获客与成交渠道，并说明：用户动机、战略意义（利润锚点/新客入口/曝光入口/订单基盘/活跃度来源）。
+- 强调“多渠道不是分散，而是分工”，给出结构判断并说明理由。
+
+3. 竞争格局与相对位置（Competitive Landscape）
+3.1 主要竞对列表：3–5 个典型竞品（同城同品类/同平台垂类/同客群替代）。
+- 建议用表格对比：经营年限、渠道覆盖、品牌信任、价格带、目标客群结构、优势与风险点。
+3.2 关键洞察：竞争本质是“结构更优”，明确自身优势与短板各 2–3 点。
+
+4. 价格 / 产品结构与单笔经济（Pricing, Offering & Unit Economics）
+4.1 有效成交区间：多个价格带；评估成交频次、利润水平、对应客群。
+4.2 产品/方案结构：是否与支付意愿匹配；强调价格“解释空间”。
+4.3 竞对价格带监测：设计简单雷达机制，保持核心产品处于“可解释区间”。
+
+5. 时间 / 场景维度需求结构（Time / Scenario-based Demand）
+5.1 时间维度：一天/一周/项目周期；哪些时段决定规模/利润弹性。
+5.2 场景维度：工作日vs周末、线上vs线下、首次vs复购、试点vs全量 rollout；标注各场景战略意义。
+
+6. 战略结论（Strategic Implications）
+- 3–5 条有力度的判断句：阶段、增长来源“不是X而是Y”、哪些资产尚未转译为增长杠杆；每条判断要解释逻辑来源。
+
+7. 增长举措与执行路线图（Strategic Initiatives & Execution Roadmap）
+7.1 3–5 条核心增长策略：适用渠道/客群/场景；动作逻辑；预期影响。
+7.2 渠道分工下的产品/内容架构：不同渠道按动机分层设计；给出清晰结构建议。
+7.3 量化 KPI 与监测节奏：给出可量化目标 + 监测周期 + 预警信号。
+7.4 预期整体影响：3–6个月、6–12个月在收入/盈利/风险分散/品牌资产放大上的影响。
+
+输出风格与格式要求
+- 报告必须分章节、分小节，使用清晰标题。
+- 尽量使用表格展示对比（竞品、渠道角色、价格带 vs 成交表现）。
+- 语言：简洁、有判断力，避免空洞形容词；多用“结构/逻辑/角色/分层/杠杆/解释空间”等概念。
+- 每条建议尽量落到：谁来做、在哪个渠道/场景做、做什么动作、期望看到哪些数据变化。
+""".strip()
+
+def build_quick_prompt(place_details: Dict[str, Any],
+                       acs_data: Optional[Dict[str, Any]],
+                       tract_info: Optional[Dict[str, Any]],
+                       extra_context: str,
+                       report_date: str,
+                       lang: str) -> str:
+    blob = {
+        "report_date": report_date,
+        "business": {
+            "name": place_details.get("name", ""),
+            "address": place_details.get("formatted_address", ""),
+            "types": place_details.get("types", []),
+            "rating": place_details.get("rating", None),
+            "user_ratings_total": place_details.get("user_ratings_total", None),
+            "phone": place_details.get("formatted_phone_number", ""),
+            "website": place_details.get("website", ""),
+            "google_url": place_details.get("url", ""),
+            "opening_hours": place_details.get("opening_hours", {}),
+            "reviews_sample": (place_details.get("reviews", []) or [])[:6],
+            "geo": (place_details.get("geometry", {}) or {}).get("location", {}),
+        },
+        "trade_area": {
+            "tract_info": tract_info,
+            "acs": acs_data,
+            "assumption_note": "ACS 为 tract 级别代理，作为区域画像方向性参考。"
+        },
+        "extra_business_context": extra_context.strip(),
+        "current_date": dt.datetime.now().strftime("%Y-%m-%d"),
+    }
+
+    if lang == "English":
+        lang_rule = "Output language MUST be English."
+    else:
+        lang_rule = "输出语言必须是中文（简体），除非专有名词需要英文。"
+
+    return f"""
+{MULTI_SYSTEM_STYLE}
+
+{lang_rule}
+
+Hard requirements:
+1) Do NOT output Markdown.
+2) Headings must be numbered like "0. ...", "1. ...", "1.1 ...".
+3) Each major chapter starts with 3-5 Key Takeaways.
+4) Every recommendation must include: Action, Reason, Expected Impact, KPI, 2-week Validation method.
+5) Must include explicit section: Data Gaps & How to Collect.
+6) Must include at least 2 plain text tables (not Markdown).
+
+Input JSON:
+{json.dumps(blob, ensure_ascii=False, indent=2)}
+
+Start writing now:
+""".strip()
+
+
+# =========================================================
 # PDF Render (safer)
 # =========================================================
 def draw_footer(c: canvas.Canvas, report_date: str, page_num: int):
@@ -1028,7 +1185,7 @@ def render_pdf(report_text: str, inputs: ReportInputs) -> str:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     safe_name = "".join([ch if ch.isalnum() or ch in ("_", "-", " ") else "_" for ch in inputs.restaurant_en]).strip()
-    safe_name = safe_name.replace(" ", "_") or "Restaurant"
+    safe_name = safe_name.replace(" ", "_") or "Report"
     filename = f"AuraInsight_{safe_name}_{inputs.report_date.replace('/','-')}.pdf"
     out_path = os.path.join(OUTPUT_DIR, filename)
 
@@ -1077,21 +1234,39 @@ def render_pdf(report_text: str, inputs: ReportInputs) -> str:
         c.setFillColor(colors.black)
         font = f_cn(True) if any("\u4e00" <= ch <= "\u9fff" for ch in title) else f_en(True)
         c.setFont(font, 13)
-        c.drawString(left, y, title[:140])
+        c.drawString(left, y, title[:180])
         y -= heading_gap
 
     def draw_body(text: str):
         nonlocal y
-        max_chars = 100
-        for line in wrap_lines_by_chars(text, max_chars):
-            if y < bottom_margin:
-                new_page()
-            font = f_en(False) if is_ascii_line(line) else f_cn(False)
-            c.setFillColor(colors.black)
-            c.setFont(font, body_font_size)
-            c.drawString(left, y, line)
-            y -= line_gap
-        y -= para_gap
+        available_w = PAGE_W - left - 0.90 * inch  # 右边留白对称
+
+        for raw in text.splitlines():
+            if not raw.strip():
+                if y < bottom_margin:
+                    new_page()
+                y -= line_gap
+                continue
+
+            font0 = f_en(False) if is_ascii_line(raw) else f_cn(False)
+            c.setFont(font0, body_font_size)
+
+            wrapped = wrap_lines_by_pdf_width(
+                raw,
+                font_name=font0,
+                font_size=body_font_size,
+                max_width=available_w
+            )
+
+            for line in wrapped:
+                if y < bottom_margin:
+                    new_page()
+                    c.setFont(font0, body_font_size)
+                c.setFillColor(colors.black)
+                c.drawString(left, y, line)
+                y -= line_gap
+
+            y -= para_gap
 
     draw_bg(c, BG_CONTENT)
     sections = parse_sections(report_text)
@@ -1164,30 +1339,29 @@ if not google_key:
 if not openai_key:
     st.warning("未检测到 OPENAI_API_KEY，请在 .streamlit/secrets.toml 配置。")
 
-# ✅ tabs：新增“快速诊断报告”
-tab_report, tab_quick, tab_menu = st.tabs(["商圈分析报告", "快速诊断报告", "菜单智能调整"])
+tab_food, tab_quick, tab_menu = st.tabs(["餐饮业态分析报告", "多业态快速诊断报告", "菜单智能调整"])
 
 
 # =========================================================
-# Tab A: Report
+# Tab 1: 餐饮业态分析报告（原：商圈分析报告）
 # =========================================================
-with tab_report:
+with tab_food:
     st.subheader("Step 1｜输入地址 → 搜索附近餐厅")
-    address_input = st.text_input("输入地址（用于定位并搜索附近餐厅）", value="2406 19th Ave, San Francisco, CA 94116", key="addr_search")
+    address_input = st.text_input("输入地址（用于定位并搜索附近餐厅）", value="2406 19th Ave, San Francisco, CA 94116", key="addr_search_food")
 
-    if st.button("搜索附近餐厅", type="primary", disabled=not google_key, key="btn_search_nearby"):
+    if st.button("搜索附近餐厅", type="primary", disabled=not google_key, key="btn_search_nearby_food"):
         geo = google_geocode(address_input, google_key)
         if not geo:
             st.error("无法解析地址，请输入更完整地址（含城市/州）。")
         else:
             lat, lng = geo
-            places = google_nearby_restaurants(lat, lng, google_key, radius_m=nearby_radius_m)
-            st.session_state["geo"] = (lat, lng)
-            st.session_state["places"] = places
+            places = google_nearby_places(lat, lng, google_key, radius_m=nearby_radius_m, place_type="restaurant")
+            st.session_state["food_geo"] = (lat, lng)
+            st.session_state["food_places"] = places
             st.success(f"已找到 {len(places)} 家附近餐厅。")
 
-    places = st.session_state.get("places", [])
-    place_details = st.session_state.get("place_details", {})
+    places = st.session_state.get("food_places", [])
+    place_details = st.session_state.get("food_place_details", {})
 
     if places:
         options, id_map = [], {}
@@ -1201,10 +1375,10 @@ with tab_report:
             options.append(label)
             id_map[label] = pid
 
-        selected_label = st.selectbox("选择目标餐厅（Google Nearby）", options, key="sel_place")
+        selected_label = st.selectbox("选择目标餐厅（Google Nearby）", options, key="sel_place_food")
         selected_place_id = id_map.get(selected_label)
 
-        if st.button("拉取餐厅详情（Google Place Details）", disabled=not google_key, key="btn_details"):
+        if st.button("拉取餐厅详情（Google Place Details）", disabled=not google_key, key="btn_details_food"):
             if not selected_place_id:
                 st.error("请先选择一个餐厅。")
             else:
@@ -1212,7 +1386,7 @@ with tab_report:
                 if not details:
                     st.error("拉取详情失败。")
                 else:
-                    st.session_state["place_details"] = details
+                    st.session_state["food_place_details"] = details
                     st.success("已拉取餐厅详情。")
                     place_details = details
 
@@ -1224,11 +1398,11 @@ with tab_report:
 
         col1, col2 = st.columns([1, 1])
         with col1:
-            restaurant_en = st.text_input("餐厅英文名", value=place_details.get("name", ""), key="r_en")
-            restaurant_cn = st.text_input("餐厅中文名（可选）", value="", key="r_cn")
-            formatted_address = st.text_input("餐厅地址", value=place_details.get("formatted_address", address_input), key="r_addr")
+            restaurant_en = st.text_input("餐厅英文名", value=place_details.get("name", ""), key="food_r_en")
+            restaurant_cn = st.text_input("餐厅中文名（可选）", value="", key="food_r_cn")
+            formatted_address = st.text_input("餐厅地址", value=place_details.get("formatted_address", address_input), key="food_r_addr")
             st.caption(f"Google：⭐{place_details.get('rating','')}（{place_details.get('user_ratings_total','')} reviews）")
-            extra_context = st.text_area("补充业务背景（可选）", value="", height=120, key="r_ctx")
+            extra_context = st.text_area("补充业务背景（可选）", value="", height=120, key="food_r_ctx")
 
         with col2:
             st.markdown("### 门店外卖菜单上传")
@@ -1236,25 +1410,25 @@ with tab_report:
                 "上传门店菜单（png/jpg/txt/csv/xlsx，多文件）",
                 type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
                 accept_multiple_files=True,
-                key="own_menu_files_report"
+                key="food_own_menu_files"
             )
 
         with st.expander("自动获取商圈人口/收入/年龄/族裔/租住比例（US Census ACS）", expanded=True):
             if rest_lat and rest_lng:
-                if st.button("获取 ACS 商圈画像（自动）", key="btn_acs"):
+                if st.button("获取 ACS 商圈画像（自动）", key="food_btn_acs"):
                     tract_info = census_tract_from_latlng(rest_lat, rest_lng)
                     if not tract_info:
                         st.warning("无法获取 tract 信息（Census geocoder）。")
                     else:
                         acs_data = acs_5y_profile(tract_info["STATE"], tract_info["COUNTY"], tract_info["TRACT"], year=2023)
-                        st.session_state["tract_info"] = tract_info
-                        st.session_state["acs_data"] = acs_data
+                        st.session_state["food_tract_info"] = tract_info
+                        st.session_state["food_acs_data"] = acs_data
                         st.success("已获取 ACS 数据（tract 级别代理）。")
             else:
                 st.info("未能从 Google Place Details 获取坐标，无法调用 ACS。")
 
-            tract_info = st.session_state.get("tract_info", None)
-            acs_data = st.session_state.get("acs_data", None)
+            tract_info = st.session_state.get("food_tract_info", None)
+            acs_data = st.session_state.get("food_acs_data", None)
             if acs_data:
                 st.write({
                     "ACS Year": acs_data.get("year"),
@@ -1268,15 +1442,15 @@ with tab_report:
                 })
 
         with st.expander("上传订单报表（CSV，可选：用于时段/客单/热销/KPI）", expanded=False):
-            order_files = st.file_uploader("上传平台订单导出 CSV（可多选）", type=["csv"], accept_multiple_files=True, key="orders_report")
+            order_files = st.file_uploader("上传平台订单导出 CSV（可多选）", type=["csv"], accept_multiple_files=True, key="food_orders_report")
             orders_meta = summarize_orders(order_files or [])
             if order_files:
                 st.json(orders_meta)
         if "orders_meta" not in locals():
             orders_meta = {"files": [], "note": "No uploads"}
 
-        st.subheader("Step 3｜生成深度分析报告（含图表 + PDF）")
-        if st.button("生成报告内容", type="primary", disabled=not openai_key, key="btn_gen_report"):
+        st.subheader("Step 3｜生成报告内容（先预览可编辑，再生成 PDF）")
+        if st.button("生成报告内容", type="primary", disabled=not openai_key, key="food_btn_gen_report"):
             progress = st.progress(0)
             status = st.empty()
 
@@ -1294,8 +1468,8 @@ with tab_report:
             charts = build_charts(own_df, [])
 
             step(60, "生成报告正文…")
-            tract_info = st.session_state.get("tract_info", None)
-            acs_data = st.session_state.get("acs_data", None)
+            tract_info = st.session_state.get("food_tract_info", None)
+            acs_data = st.session_state.get("food_acs_data", None)
 
             inputs = ReportInputs(
                 report_date=report_date,
@@ -1320,19 +1494,19 @@ with tab_report:
             step(80, "扩写补全（确保足够细）…")
             report_text = ensure_long_enough(report_text, openai_key, model=model, lang=report_lang, min_chars=12000)
 
-            st.session_state["report_text"] = report_text
-            st.session_state["report_inputs"] = inputs
+            st.session_state["food_report_text"] = report_text
+            st.session_state["food_report_inputs"] = inputs
 
-            step(100, "完成：可预览与生成PDF。")
+            step(100, "完成：可预览编辑，再生成PDF。")
             status.success("报告已生成。")
 
-        report_text = st.session_state.get("report_text", "")
-        report_inputs: Optional[ReportInputs] = st.session_state.get("report_inputs", None)
+        report_text = st.session_state.get("food_report_text", "")
+        report_inputs: Optional[ReportInputs] = st.session_state.get("food_report_inputs", None)
 
         if report_text and report_inputs:
             st.subheader("报告预览（可编辑）")
-            edited = st.text_area("报告正文", value=report_text, height=520, key="report_editor")
-            st.session_state["report_text"] = sanitize_text(edited)
+            edited = st.text_area("报告正文", value=report_text, height=520, key="food_report_editor")
+            st.session_state["food_report_text"] = sanitize_text(edited)
 
             st.subheader("图表预览（将自动附在 PDF 后面）")
             if report_inputs.charts:
@@ -1350,212 +1524,193 @@ with tab_report:
                 st.info("暂无图表（通常是菜单价格识别不足导致）。")
 
             st.subheader("Step 4｜生成 PDF（含图表页）")
-            if st.button("生成 PDF", type="primary", key="btn_pdf"):
+            if st.button("生成 PDF", type="primary", key="food_btn_pdf"):
                 with st.spinner("正在生成 PDF..."):
-                    pdf_path = render_pdf(st.session_state["report_text"], report_inputs)
+                    pdf_path = render_pdf(st.session_state["food_report_text"], report_inputs)
                 st.success("PDF 生成完成。")
                 with open(pdf_path, "rb") as f:
                     st.download_button("下载 PDF", f, file_name=os.path.basename(pdf_path), mime="application/pdf")
                 st.caption(f"输出路径：{pdf_path}")
         else:
-            st.info("先生成报告后，这里会出现预览与PDF下载。")
+            st.info("先生成报告内容后，这里会出现预览与PDF下载。")
 
 
 # =========================================================
-# Tab Quick: 快速诊断报告
+# Tab 2: 多业态快速诊断报告
 # =========================================================
 with tab_quick:
-    st.subheader("快速诊断报告｜输入地址 → 选中商家 → 一键生成可交付短诊断 + PDF")
-    st.caption("适用：头疗/美容/按摩/美甲/零售/本地服务等。输出刻意写成“人写的判断”，短、狠、能落地。")
+    st.subheader("Step 1｜输入地址 → 搜索附近商家（可用于餐厅/头疗/美容/零售/健身等）")
+    address_input = st.text_input("输入地址（用于定位并搜索附近商家）", value="San Bruno, CA", key="addr_search_quick")
 
-    colQ1, colQ2 = st.columns([1, 1])
+    place_type = st.selectbox(
+        "选择要搜索的商家类型（Google Places type）",
+        ["establishment", "restaurant", "beauty_salon", "spa", "hair_care", "gym", "store", "cafe", "doctor", "dentist"],
+        index=0,
+        key="quick_place_type"
+    )
 
-    with colQ1:
-        q_address = st.text_input("输入地址（用于定位并搜索附近商家）", value="San Bruno, CA", key="q_addr_search")
+    if st.button("搜索附近商家", type="primary", disabled=not google_key, key="btn_search_nearby_quick"):
+        geo = google_geocode(address_input, google_key)
+        if not geo:
+            st.error("无法解析地址，请输入更完整地址（含城市/州）。")
+        else:
+            lat, lng = geo
+            places = google_nearby_places(lat, lng, google_key, radius_m=nearby_radius_m, place_type=place_type)
+            st.session_state["quick_geo"] = (lat, lng)
+            st.session_state["quick_places"] = places
+            st.success(f"已找到 {len(places)} 个附近商家。")
 
-        business_type = st.selectbox(
-            "选择业务类型（用于 Google Nearby 过滤）",
-            ["spa", "beauty_salon", "hair_care", "nail_salon", "massage", "gym", "store", "restaurant", "all"],
-            index=0,
-            key="q_place_type"
-        )
+    places = st.session_state.get("quick_places", [])
+    q_place_details = st.session_state.get("quick_place_details", {})
 
-        q_keyword = st.text_input("可选：关键词（更精准，比如 head spa / scalp / 头疗）", value="head spa", key="q_keyword")
-        q_nearby_radius_m = st.slider("Nearby 搜索半径（米）", 300, 4000, 1800, 100, key="q_radius_m")
+    if places:
+        options, id_map = [], {}
+        for p in places:
+            name = p.get("name", "")
+            addr = p.get("vicinity", "")
+            rating = p.get("rating", "NA")
+            total = p.get("user_ratings_total", "NA")
+            pid = p.get("place_id", "")
+            label = f"{name} | {addr} | ⭐{rating} ({total})"
+            options.append(label)
+            id_map[label] = pid
 
-        if st.button("搜索附近商家", type="primary", disabled=not google_key, key="q_btn_search"):
-            geo = google_geocode(q_address, google_key)
-            if not geo:
-                st.error("无法解析地址，请输入更完整地址（含城市/州）。")
+        selected_label = st.selectbox("选择目标商家（Google Nearby）", options, key="sel_place_quick")
+        selected_place_id = id_map.get(selected_label)
+
+        if st.button("拉取商家详情（Google Place Details）", disabled=not google_key, key="btn_details_quick"):
+            if not selected_place_id:
+                st.error("请先选择一个商家。")
             else:
-                lat, lng = geo
-                pt = None if business_type == "all" else business_type
-                kw = q_keyword.strip() or None
-                places = google_nearby_places(lat, lng, google_key, radius_m=q_nearby_radius_m, place_type=pt, keyword=kw)
-                st.session_state["q_geo"] = (lat, lng)
-                st.session_state["q_places"] = places
-                st.success(f"已找到 {len(places)} 家附近商家。")
-
-    with colQ2:
-        q_places = st.session_state.get("q_places", [])
-        q_place_details = st.session_state.get("q_place_details", {})
-
-        if q_places:
-            options, id_map = [], {}
-            for p in q_places:
-                name = p.get("name", "")
-                addr = p.get("vicinity", "")
-                rating = p.get("rating", "NA")
-                total = p.get("user_ratings_total", "NA")
-                pid = p.get("place_id", "")
-                label = f"{name} | {addr} | ⭐{rating} ({total})"
-                options.append(label)
-                id_map[label] = pid
-
-            q_selected_label = st.selectbox("选择目标商家（Google Nearby）", options, key="q_sel_place")
-            q_selected_place_id = id_map.get(q_selected_label)
-
-            if st.button("拉取商家详情（Google Place Details）", disabled=not google_key, key="q_btn_details"):
-                if not q_selected_place_id:
-                    st.error("请先选择一个商家。")
+                details = google_place_details(selected_place_id, google_key)
+                if not details:
+                    st.error("拉取详情失败。")
                 else:
-                    details = google_place_details(q_selected_place_id, google_key)
-                    if not details:
-                        st.error("拉取详情失败。")
-                    else:
-                        st.session_state["q_place_details"] = details
-                        q_place_details = details
-                        st.success("已拉取商家详情。")
+                    st.session_state["quick_place_details"] = details
+                    st.success("已拉取商家详情。")
+                    q_place_details = details
 
-        if q_place_details:
-            st.markdown("### 商家信息确认（可编辑）")
-            q_name = st.text_input("商家名称", value=q_place_details.get("name", ""), key="q_name")
-            q_addr2 = st.text_input("商家地址", value=q_place_details.get("formatted_address", q_address), key="q_addr2")
+    if q_place_details:
+        st.subheader("Step 2｜自动商圈画像（ACS）+ 补充背景")
+        loc = (q_place_details.get("geometry", {}) or {}).get("location", {}) or {}
+        q_lat = float(loc.get("lat")) if loc.get("lat") is not None else None
+        q_lng = float(loc.get("lng")) if loc.get("lng") is not None else None
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            business_name = st.text_input("业务名称（可手动改）", value=q_place_details.get("name", ""), key="quick_name")
+            business_address = st.text_input("业务地址", value=q_place_details.get("formatted_address", ""), key="quick_addr")
             st.caption(f"Google：⭐{q_place_details.get('rating','')}（{q_place_details.get('user_ratings_total','')} reviews）")
+        with col2:
+            extra_context = st.text_area("补充业务背景（可选）", value="", height=140, key="quick_ctx")
 
-            loc = (q_place_details.get("geometry", {}) or {}).get("location", {}) or {}
-            b_lat = float(loc.get("lat")) if loc.get("lat") is not None else None
-            b_lng = float(loc.get("lng")) if loc.get("lng") is not None else None
-
-            with st.expander("自动获取商圈画像（US Census ACS, tract proxy）", expanded=True):
-                if b_lat and b_lng:
-                    if st.button("获取 ACS 商圈画像（自动）", key="q_btn_acs"):
-                        tract_info = census_tract_from_latlng(b_lat, b_lng)
-                        if not tract_info:
-                            st.warning("无法获取 tract 信息（Census geocoder）。")
-                        else:
-                            acs_data = acs_5y_profile(tract_info["STATE"], tract_info["COUNTY"], tract_info["TRACT"], year=2023)
-                            st.session_state["q_tract_info"] = tract_info
-                            st.session_state["q_acs_data"] = acs_data
-                            st.success("已获取 ACS 数据（tract 级别代理）。")
-                else:
-                    st.info("无法从 Place Details 获取坐标，无法调用 ACS。")
-
-                q_tract_info = st.session_state.get("q_tract_info", None)
-                q_acs_data = st.session_state.get("q_acs_data", None)
-                if q_acs_data:
-                    st.write({
-                        "ACS Year": q_acs_data.get("year"),
-                        "Geography": q_acs_data.get("name"),
-                        "Population (tract)": None if q_acs_data.get("pop_total") is None else int(q_acs_data.get("pop_total")),
-                        "Median HH Income": None if q_acs_data.get("median_income") is None else f"${int(q_acs_data.get('median_income')):,}",
-                        "Median Age": q_acs_data.get("median_age"),
-                        "% Asian (proxy)": None if q_acs_data.get("pct_asian") is None else f"{q_acs_data.get('pct_asian')*100:.1f}%",
-                        "% Renter (proxy)": None if q_acs_data.get("pct_renter") is None else f"{q_acs_data.get('pct_renter')*100:.1f}%",
-                        "Note": "ACS 为 tract 级别代理，作为商圈画像方向性参考。"
-                    })
-
-            st.markdown("### 一键生成“快速诊断报告”")
-            if st.button("生成快速诊断报告", type="primary", disabled=not openai_key, key="q_btn_gen"):
-                progress = st.progress(0)
-                status = st.empty()
-
-                def step(pct: int, msg: str):
-                    progress.progress(pct)
-                    status.info(msg)
-
-                step(10, "抓取附近同类竞对（样本）…")
-                competitors_sample: List[Dict[str, Any]] = []
-                try:
-                    if b_lat and b_lng:
-                        pt = None if business_type == "all" else business_type
-                        kw = q_keyword.strip() or None
-                        comp_places = google_nearby_places(b_lat, b_lng, google_key, radius_m=q_nearby_radius_m, place_type=pt, keyword=kw)
-                        self_pid = q_place_details.get("place_id")
-                        for cp in comp_places:
-                            if cp.get("place_id") == self_pid:
-                                continue
-                            competitors_sample.append({
-                                "name": cp.get("name"),
-                                "vicinity": cp.get("vicinity"),
-                                "rating": cp.get("rating"),
-                                "user_ratings_total": cp.get("user_ratings_total"),
-                                "types": cp.get("types", [])[:6],
-                            })
-                except Exception:
-                    competitors_sample = []
-
-                step(55, "生成短诊断正文（可交付）…")
-                q_tract_info = st.session_state.get("q_tract_info", None)
-                q_acs_data = st.session_state.get("q_acs_data", None)
-
-                prompt = build_quick_diag_prompt(
-                    business_name=q_name.strip(),
-                    address=q_addr2.strip(),
-                    place_details=q_place_details,
-                    acs_data=q_acs_data,
-                    tract_info=q_tract_info,
-                    competitors=competitors_sample,
-                    lang=report_lang
-                )
-                quick_text = openai_text(prompt, openai_key, model=model, temperature=0.35)
-                quick_text = sanitize_text(quick_text)
-
-                report_date = dt.datetime.now().strftime("%m/%d/%Y")
-                inputs = ReportInputs(
-                    report_date=report_date,
-                    restaurant_cn=q_name.strip(),
-                    restaurant_en=q_name.strip(),
-                    address=q_addr2.strip(),
-                    radius_miles=0.0,
-                    own_menu_meta={"label":"N/A","files":[],"extracted":{"items":[],"promos":[],"notes":[]}},
-                    orders_meta={"files":[],"note":"N/A"},
-                    competitors=[],
-                    extra_business_context="Quick Diagnostic Report",
-                    acs=q_acs_data,
-                    tract_info=q_tract_info,
-                    restaurant_google=q_place_details,
-                    charts={},
-                )
-
-                st.session_state["q_quick_text"] = quick_text
-                st.session_state["q_quick_inputs"] = inputs
-
-                step(100, "完成：可预览与生成PDF。")
-                status.success("快速诊断报告已生成。")
-
-            q_quick_text = st.session_state.get("q_quick_text", "")
-            q_quick_inputs = st.session_state.get("q_quick_inputs", None)
-
-            if q_quick_text and q_quick_inputs:
-                st.subheader("快速诊断报告预览（可编辑）")
-                edited = st.text_area("诊断正文", value=q_quick_text, height=420, key="q_quick_editor")
-                st.session_state["q_quick_text"] = sanitize_text(edited)
-
-                st.subheader("生成 PDF（复用原模板）")
-                if st.button("生成 PDF（快速诊断报告）", type="primary", key="q_btn_pdf"):
-                    with st.spinner("正在生成 PDF..."):
-                        pdf_path = render_pdf(st.session_state["q_quick_text"], q_quick_inputs)
-                    st.success("PDF 生成完成。")
-                    with open(pdf_path, "rb") as f:
-                        st.download_button("下载 PDF", f, file_name=os.path.basename(pdf_path), mime="application/pdf")
-                    st.caption(f"输出路径：{pdf_path}")
+        with st.expander("自动获取区域画像（US Census ACS）", expanded=True):
+            if q_lat and q_lng:
+                if st.button("获取 ACS 区域画像（自动）", key="quick_btn_acs"):
+                    tract_info = census_tract_from_latlng(q_lat, q_lng)
+                    if not tract_info:
+                        st.warning("无法获取 tract 信息（Census geocoder）。")
+                    else:
+                        acs_data = acs_5y_profile(tract_info["STATE"], tract_info["COUNTY"], tract_info["TRACT"], year=2023)
+                        st.session_state["quick_tract_info"] = tract_info
+                        st.session_state["quick_acs_data"] = acs_data
+                        st.success("已获取 ACS 数据（tract 级别代理）。")
             else:
-                st.info("先搜索商家并生成快速诊断报告，这里会出现预览与PDF下载。")
+                st.info("未能从 Google Place Details 获取坐标，无法调用 ACS。")
+
+            tract_info = st.session_state.get("quick_tract_info", None)
+            acs_data = st.session_state.get("quick_acs_data", None)
+            if acs_data:
+                st.write({
+                    "ACS Year": acs_data.get("year"),
+                    "Geography": acs_data.get("name"),
+                    "Population (tract)": None if acs_data.get("pop_total") is None else int(acs_data.get("pop_total")),
+                    "Median HH Income": None if acs_data.get("median_income") is None else f"${int(acs_data.get('median_income')):,}",
+                    "Median Age": acs_data.get("median_age"),
+                    "% Asian (proxy)": None if acs_data.get("pct_asian") is None else f"{acs_data.get('pct_asian')*100:.1f}%",
+                    "% Renter (proxy)": None if acs_data.get("pct_renter") is None else f"{acs_data.get('pct_renter')*100:.1f}%",
+                    "Note": "ACS 为 tract 级别代理，作为区域画像方向性参考。"
+                })
+
+        st.subheader("Step 3｜生成快速诊断报告内容（先预览可编辑，再生成 PDF）")
+        if st.button("生成报告内容", type="primary", disabled=not openai_key, key="quick_btn_gen"):
+            progress = st.progress(0)
+            status = st.empty()
+
+            def step(pct: int, msg: str):
+                progress.progress(pct)
+                status.info(msg)
+
+            report_date = dt.datetime.now().strftime("%m/%d/%Y")
+            step(25, "整理输入数据…")
+            tract_info = st.session_state.get("quick_tract_info", None)
+            acs_data = st.session_state.get("quick_acs_data", None)
+
+            # 强制覆盖 name/address（用户可手动改）
+            q_place_details2 = dict(q_place_details)
+            q_place_details2["name"] = business_name.strip()
+            q_place_details2["formatted_address"] = business_address.strip()
+
+            step(60, "AI 生成快速诊断正文…")
+            prompt = build_quick_prompt(
+                place_details=q_place_details2,
+                acs_data=acs_data,
+                tract_info=tract_info,
+                extra_context=extra_context,
+                report_date=report_date,
+                lang=report_lang
+            )
+            text_out = openai_text(prompt, openai_key, model=model, temperature=0.25)
+            text_out = sanitize_text(text_out)
+
+            step(85, "扩写补全（确保足够细）…")
+            text_out = ensure_long_enough(text_out, openai_key, model=model, lang=report_lang, min_chars=9000)
+
+            # 复用 ReportInputs 作为 PDF 封面/页脚信息
+            inputs = ReportInputs(
+                report_date=report_date,
+                restaurant_cn=business_name.strip(),
+                restaurant_en=business_name.strip(),
+                address=business_address.strip(),
+                radius_miles=radius_miles,
+                own_menu_meta={"label": "N/A", "files": [], "extracted": {"note": "N/A", "items": [], "promos": [], "notes": []}},
+                orders_meta={"files": [], "note": "N/A"},
+                competitors=[],
+                extra_business_context=extra_context.strip(),
+                acs=acs_data,
+                tract_info=tract_info,
+                restaurant_google=q_place_details2,
+                charts={},
+            )
+
+            st.session_state["quick_report_text"] = text_out
+            st.session_state["quick_report_inputs"] = inputs
+
+            step(100, "完成：可预览编辑，再生成PDF。")
+            status.success("快速诊断报告已生成。")
+
+        q_text = st.session_state.get("quick_report_text", "")
+        q_inputs: Optional[ReportInputs] = st.session_state.get("quick_report_inputs", None)
+
+        if q_text and q_inputs:
+            st.subheader("报告预览（可编辑）")
+            edited = st.text_area("报告正文", value=q_text, height=520, key="quick_editor")
+            st.session_state["quick_report_text"] = sanitize_text(edited)
+
+            st.subheader("Step 4｜生成 PDF")
+            if st.button("生成 PDF", type="primary", key="quick_btn_pdf"):
+                with st.spinner("正在生成 PDF..."):
+                    pdf_path = render_pdf(st.session_state["quick_report_text"], q_inputs)
+                st.success("PDF 生成完成。")
+                with open(pdf_path, "rb") as f:
+                    st.download_button("下载 PDF", f, file_name=os.path.basename(pdf_path), mime="application/pdf")
+                st.caption(f"输出路径：{pdf_path}")
+        else:
+            st.info("先生成报告内容后，这里会出现预览与PDF下载。")
 
 
 # =========================================================
-# Tab B: Menu Optimizer (NEW switches)
+# Tab 3: Menu Optimizer (保持原功能)
 # =========================================================
 with tab_menu:
     st.subheader("菜单智能调整（价格锚点 + 心理定价 + 同行对标 + 套餐重构 + 抽佣测算）")
