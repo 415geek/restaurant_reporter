@@ -1,4 +1,3 @@
-
 import os
 import re
 import io
@@ -233,7 +232,7 @@ def parse_sections(text: str) -> List[Tuple[str, str]]:
         if cur_title is not None:
             sections.append((cur_title.strip(), "\n".join(cur_body).strip()))
         cur_title = None
-        cur_body = []
+        cur_body[:] = []
 
     for ln in text.splitlines():
         ln_stripped = ln.strip()
@@ -288,10 +287,42 @@ def google_nearby_restaurants(lat: float, lng: float, api_key: str, radius_m: in
         params = {"pagetoken": token, "key": api_key}
     return results
 
+def google_nearby_places(lat: float, lng: float, api_key: str, radius_m: int = 1200,
+                         place_type: Optional[str] = None,
+                         keyword: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Google Places Nearby Search (generic).
+    - place_type: e.g. "beauty_salon", "spa", "hair_care", "restaurant"
+    - keyword: e.g. "head spa", "scalp", "massage"
+    """
+    url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    results: List[Dict[str, Any]] = []
+
+    params = {"location": f"{lat},{lng}", "radius": radius_m, "key": api_key}
+    if place_type:
+        params["type"] = place_type
+    if keyword:
+        params["keyword"] = keyword
+
+    for _ in range(3):
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") not in ("OK", "ZERO_RESULTS"):
+            break
+        results.extend(data.get("results", []))
+        token = data.get("next_page_token")
+        if not token:
+            break
+        time.sleep(2)
+        params = {"pagetoken": token, "key": api_key}
+
+    return results
+
 def google_place_details(place_id: str, api_key: str) -> Dict[str, Any]:
     url = "https://maps.googleapis.com/maps/api/place/details/json"
     fields = ",".join([
-        "name","formatted_address","rating","user_ratings_total","types",
+        "place_id","name","formatted_address","rating","user_ratings_total","types",
         "url","website","formatted_phone_number","opening_hours","reviews","geometry"
     ])
     r = requests.get(url, params={"place_id": place_id, "fields": fields, "key": api_key}, timeout=30)
@@ -300,15 +331,6 @@ def google_place_details(place_id: str, api_key: str) -> Dict[str, Any]:
     if data.get("status") != "OK":
         return {}
     return data.get("result", {})
-
-def google_textsearch_place_id(query: str, api_key: str) -> Optional[str]:
-    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    r = requests.get(url, params={"query": query, "key": api_key}, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("status") != "OK" or not data.get("results"):
-        return None
-    return data["results"][0].get("place_id")
 
 
 # =========================================================
@@ -628,10 +650,9 @@ def build_charts(own_df: pd.DataFrame, comps: List[Tuple[str, pd.DataFrame]]) ->
 
 
 # =========================================================
-# Menu Optimizer (anchor + market + bundles)
+# Menu Optimizer (anchor + market + bundles + commission + price layers)
 # =========================================================
 def summarize_market_prices(own_df: pd.DataFrame, comp_dfs: List[pd.DataFrame]) -> Dict[str, Any]:
-    # market medians by category (best-effort)
     all_comp = pd.concat([df for df in comp_dfs if df is not None and not df.empty], ignore_index=True) if comp_dfs else pd.DataFrame()
     out = {"own": {}, "market": {}, "notes": []}
 
@@ -655,7 +676,6 @@ def summarize_market_prices(own_df: pd.DataFrame, comp_dfs: List[pd.DataFrame]) 
     out["market"]["p75"] = float(mkt_prices.quantile(0.75))
     out["market"]["count_price"] = int(mkt_prices.shape[0])
 
-    # category median
     cat_med = (all_comp.dropna(subset=["price"])
                .groupby("category")["price"].median()
                .sort_values(ascending=False))
@@ -670,21 +690,27 @@ def build_menu_optimizer_prompt(
     own_menu_meta: Dict[str, Any],
     competitor_menu_metas: List[Dict[str, Any]],
     market_summary: Dict[str, Any],
-    lang: str = "中文"
+    lang: str,
+    objective_mode: str,
+    commission_rate: float,
+    price_layering: bool,
 ) -> str:
-    # Hard rule: Step C priority: (1) if no bundles OR overpriced -> adjust price first, then build bundles, then final menu.
-    # Output: JSON rows for menu table.
     blob = {
         "restaurant_name": restaurant_name,
         "address": address,
         "season_hint": season_hint,
+        "objective_mode": objective_mode,
+        "platform_commission_rate": commission_rate,
+        "price_layering": price_layering,
         "own_menu": own_menu_meta,
         "competitors": competitor_menu_metas,
         "market_summary": market_summary,
         "pricing_rules": {
-            "psych": "以心理定价(9/9.5/8.9/18.95等) + 价格锚点(引流/主推/高毛利/形象款)构建价格梯度",
-            "step_c": "若无法识别套餐或整体偏高(对比market_summary)，先下调到合理价带，再组套餐，最后生成完整菜单",
-            "bundle_policy": "套餐必须有清晰的节省感(例如省$2-$5)，并指定适用菜品；控制风险(限制规则/不可叠加/指定时段)",
+            "psych": "用心理定价(9/9.5/8.9/18.95/19.95等) + 价格锚点(引流/主推/高毛利/形象款)构建价格梯度",
+            "step_c": "若无法识别套餐或整体偏高(对比market_summary)，先把价格调到合理价带，再组套餐，最后生成完整菜单",
+            "bundle_policy": "套餐必须有清晰节省感(省$2-$5)；要明确适用菜品、限制规则、不可叠加；给出可执行文案",
+            "commission": "外卖价必须考虑平台抽佣，避免净到手过低；堂食价可以更亲民，外卖价用于覆盖抽佣成本",
+            "objective": "若objective_mode=acquisition，则要给出1-2个引流爆款(低毛利高转化)+1个高毛利补贴；若profit则提高高毛利主推占比并减少过激折扣"
         },
         "output_schema": {
             "rows": [
@@ -693,9 +719,14 @@ def build_menu_optimizer_prompt(
                     "name_cn": "",
                     "name_en": "",
                     "name": "",
-                    "price": 0.0,
+                    "raw_category": "",
+                    "price_dine_in": 0.0,
+                    "price_delivery": 0.0,
                     "price_old": None,
-                    "raw_category": ""
+                    "commission_rate": 0.0,
+                    "commission_fee_est": 0.0,
+                    "net_after_commission_est": 0.0,
+                    "notes": ""
                 }
             ]
         }
@@ -703,25 +734,27 @@ def build_menu_optimizer_prompt(
 
     if lang == "English":
         instruction = (
-            "You are a restaurant menu engineering expert in the US delivery market.\n"
+            "You are a US delivery-market menu engineering expert.\n"
             "Task: rebuild a FULL menu structure from extracted items.\n"
-            "Critical Step C: If bundles are missing OR the overall pricing is overpriced vs market_summary, "
+            "Critical Step C: If bundles are missing OR overall pricing is overpriced vs market_summary, "
             "first adjust to a reasonable price band using anchor & psychological pricing, then create bundles, "
             "then output the final full menu.\n"
-            "You MUST incorporate market reality using market_summary and competitor menus.\n"
-            "Return JSON ONLY, no extra text.\n"
+            "You MUST incorporate competitor menus + market_summary.\n"
+            "Commission-aware: delivery price MUST account for platform commission_rate.\n"
+            "If price_layering=true, output both dine-in and delivery prices; otherwise set them equal.\n"
+            "Return JSON ONLY. No extra text.\n"
         )
     else:
         instruction = (
             "你是北美外卖市场的菜单工程专家。\n"
-            "任务：根据识别到的门店菜单 + 竞对菜单 + market_summary（同行价带），重做一份“可直接上架”的创新有竞争力的完整菜单结构。\n"
-            "关键 Step C：如果没识别到套餐/或整体定价偏高（对比 market_summary），必须先把价格调整到合理区间（结合锚点+心理定价），再组套餐，最后输出完整菜单。\n"
-            "你必须结合竞对与市场真实情况，而不是机械整理。\n"
+            "任务：根据门店菜单 + 竞对菜单 + market_summary（同行价带），重做一份可直接上架的完整菜单结构。\n"
+            "关键 Step C：如果没识别到套餐/或整体定价偏高（对比 market_summary），必须先调价到合理区间（锚点+心理定价），再组套餐，最后输出完整菜单。\n"
+            "必须考虑平台抽佣：外卖价要覆盖抽佣，避免净到手过低。\n"
+            "若 price_layering=true：输出堂食价+外卖价；否则两者相同。\n"
             "只输出JSON，不要输出任何额外文字。\n"
         )
 
     return f"{instruction}\n输入JSON：\n{json.dumps(blob, ensure_ascii=False, indent=2)}"
-
 
 def generate_optimized_menu_df(
     api_key: str,
@@ -731,7 +764,10 @@ def generate_optimized_menu_df(
     own_menu_meta: Dict[str, Any],
     competitor_menu_metas: List[Dict[str, Any]],
     market_summary: Dict[str, Any],
-    lang: str
+    lang: str,
+    objective_mode: str,
+    commission_rate: float,
+    price_layering: bool,
 ) -> pd.DataFrame:
     season_hint = "按北美当前季节与下个季节给上新建议，并体现到菜单分区或命名中。"
     prompt = build_menu_optimizer_prompt(
@@ -741,14 +777,16 @@ def generate_optimized_menu_df(
         own_menu_meta=own_menu_meta,
         competitor_menu_metas=competitor_menu_metas,
         market_summary=market_summary,
-        lang=lang
+        lang=lang,
+        objective_mode=objective_mode,
+        commission_rate=commission_rate,
+        price_layering=price_layering,
     )
     text_out = openai_text(prompt, api_key, model=model, temperature=0.2)
 
     m = re.search(r"\[.*\]", text_out, flags=re.S)
     if not m:
         m = re.search(r"\{.*\}", text_out, flags=re.S)
-
     if not m:
         raise ValueError("AI 输出无法解析为 JSON。")
 
@@ -756,13 +794,22 @@ def generate_optimized_menu_df(
     rows = obj.get("rows", obj if isinstance(obj, list) else [])
     df = pd.DataFrame(rows)
 
-    # normalize columns
-    for col in ["section", "name_cn", "name_en", "name", "price", "price_old", "raw_category"]:
+    cols = [
+        "section","name_cn","name_en","name","raw_category",
+        "price_dine_in","price_delivery","price_old",
+        "commission_rate","commission_fee_est","net_after_commission_est",
+        "notes"
+    ]
+    for col in cols:
         if col not in df.columns:
             df[col] = None
 
-    # price numeric
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["price_dine_in"] = pd.to_numeric(df["price_dine_in"], errors="coerce")
+    df["price_delivery"] = pd.to_numeric(df["price_delivery"], errors="coerce")
+    df["commission_rate"] = pd.to_numeric(df["commission_rate"], errors="coerce")
+    df["commission_fee_est"] = pd.to_numeric(df["commission_fee_est"], errors="coerce")
+    df["net_after_commission_est"] = pd.to_numeric(df["net_after_commission_est"], errors="coerce")
+
     return df
 
 
@@ -860,6 +907,79 @@ Input JSON:
 {json.dumps(blob, ensure_ascii=False, indent=2)}
 
 Start writing now:
+""".strip()
+
+def build_quick_diag_prompt(
+    business_name: str,
+    address: str,
+    place_details: Dict[str, Any],
+    acs_data: Optional[Dict[str, Any]],
+    tract_info: Optional[Dict[str, Any]],
+    competitors: List[Dict[str, Any]],
+    lang: str,
+) -> str:
+    """
+    Generate a short, client-deliverable quick diagnostic.
+    Must NOT look machine-written: decisive, specific, no fluff, no 'AI', no buzzwords.
+    """
+    blob = {
+        "business": {
+            "name": business_name,
+            "address": address,
+            "google": place_details,
+        },
+        "trade_area_proxy": {
+            "tract_info": tract_info,
+            "acs": acs_data,
+            "note": "ACS 为 tract 级别代理，仅作为方向性参考。"
+        },
+        "nearby_competitors_sample": competitors[:12],
+        "generated_at": dt.datetime.now().strftime("%Y-%m-%d"),
+        "region_context": "San Francisco Bay Area / Peninsula (e.g., San Bruno, South SF, Millbrae)",
+    }
+
+    if lang == "English":
+        lang_rule = "Output language MUST be English."
+    else:
+        lang_rule = "输出语言必须是中文（简体），必要的专有名词保留英文。"
+
+    return f"""
+You are AuraInsight's field operator (not a professor).
+{lang_rule}
+
+Write a QUICK DIAGNOSTIC that reads like a human operator wrote it after scanning the local market.
+Hard rules:
+- DO NOT output Markdown.
+- DO NOT mention AI, models, prompts, or 'data analysis shows'.
+- Keep it short and sharp: ~700 to 1200 Chinese chars (or ~450 to 800 English words).
+- Use confident, specific language. No vague hedging like 'maybe', 'could be'.
+- Use local context (Peninsula / San Bruno / South SF consumer behavior).
+- Use ONLY the input JSON facts; if something is missing, call it out plainly as '信息缺口'.
+- Headings must use bracket style: 【...】 (so PDF parser can split sections).
+- The report must contain exactly these sections in order:
+
+【快速诊断报告｜一句话判决】
+1–2 sentences. Direct.
+
+【三处最可能在“漏钱/漏复购”的点】
+Exactly 3 bullets. Each bullet must be specific and operational (not generic).
+
+【一个7天内能验证的小动作】
+One action only. Include:
+- 怎么做（步骤化 3-5 行）
+- 预期变化（具体）
+- KPI（1-2 个）
+
+【你现在最不该做的两件事】
+Exactly 2 bullets. Must be realistic.
+
+【信息缺口（如果你愿意，我们下一步补齐）】
+List missing info that would make diagnosis stronger (max 6 lines).
+
+Input JSON:
+{json.dumps(blob, ensure_ascii=False, indent=2)}
+
+Start writing now.
 """.strip()
 
 def ensure_long_enough(report_text: str, api_key: str, model: str, lang: str, min_chars: int = 16000) -> str:
@@ -1021,7 +1141,6 @@ openai_key = st.secrets.get("OPENAI_API_KEY", "")
 with st.sidebar:
     st.header("配置")
     model = st.selectbox("OpenAI 模型", ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"], index=0)
-
     report_lang = st.selectbox("报告语言 / Report Language", ["中文", "English"], index=0)
 
     show_advanced = st.checkbox("显示高级设置", value=False)
@@ -1045,8 +1164,8 @@ if not google_key:
 if not openai_key:
     st.warning("未检测到 OPENAI_API_KEY，请在 .streamlit/secrets.toml 配置。")
 
-
-tab_report, tab_menu = st.tabs(["商圈分析报告", "菜单智能调整"])
+# ✅ tabs：新增“快速诊断报告”
+tab_report, tab_quick, tab_menu = st.tabs(["商圈分析报告", "快速诊断报告", "菜单智能调整"])
 
 
 # =========================================================
@@ -1098,7 +1217,7 @@ with tab_report:
                     place_details = details
 
     if place_details:
-        st.subheader("Step 2｜上传菜单 + 自动商圈画像（ACS） + 竞对菜单")
+        st.subheader("Step 2｜上传菜单 + 自动商圈画像（ACS）")
         loc = (place_details.get("geometry", {}) or {}).get("location", {}) or {}
         rest_lat = float(loc.get("lat")) if loc.get("lat") is not None else None
         rest_lng = float(loc.get("lng")) if loc.get("lng") is not None else None
@@ -1222,7 +1341,6 @@ with tab_report:
                 for k, v in report_inputs.charts.items():
                     with cols[idx % 2]:
                         st.caption(k)
-                        # FIX: bytes supported
                         if isinstance(v, (bytes, bytearray)) and len(v) > 50:
                             st.image(v, use_container_width=True)
                         else:
@@ -1244,17 +1362,235 @@ with tab_report:
 
 
 # =========================================================
-# Tab B: Menu Optimizer
+# Tab Quick: 快速诊断报告
+# =========================================================
+with tab_quick:
+    st.subheader("快速诊断报告｜输入地址 → 选中商家 → 一键生成可交付短诊断 + PDF")
+    st.caption("适用：头疗/美容/按摩/美甲/零售/本地服务等。输出刻意写成“人写的判断”，短、狠、能落地。")
+
+    colQ1, colQ2 = st.columns([1, 1])
+
+    with colQ1:
+        q_address = st.text_input("输入地址（用于定位并搜索附近商家）", value="San Bruno, CA", key="q_addr_search")
+
+        business_type = st.selectbox(
+            "选择业务类型（用于 Google Nearby 过滤）",
+            ["spa", "beauty_salon", "hair_care", "nail_salon", "massage", "gym", "store", "restaurant", "all"],
+            index=0,
+            key="q_place_type"
+        )
+
+        q_keyword = st.text_input("可选：关键词（更精准，比如 head spa / scalp / 头疗）", value="head spa", key="q_keyword")
+        q_nearby_radius_m = st.slider("Nearby 搜索半径（米）", 300, 4000, 1800, 100, key="q_radius_m")
+
+        if st.button("搜索附近商家", type="primary", disabled=not google_key, key="q_btn_search"):
+            geo = google_geocode(q_address, google_key)
+            if not geo:
+                st.error("无法解析地址，请输入更完整地址（含城市/州）。")
+            else:
+                lat, lng = geo
+                pt = None if business_type == "all" else business_type
+                kw = q_keyword.strip() or None
+                places = google_nearby_places(lat, lng, google_key, radius_m=q_nearby_radius_m, place_type=pt, keyword=kw)
+                st.session_state["q_geo"] = (lat, lng)
+                st.session_state["q_places"] = places
+                st.success(f"已找到 {len(places)} 家附近商家。")
+
+    with colQ2:
+        q_places = st.session_state.get("q_places", [])
+        q_place_details = st.session_state.get("q_place_details", {})
+
+        if q_places:
+            options, id_map = [], {}
+            for p in q_places:
+                name = p.get("name", "")
+                addr = p.get("vicinity", "")
+                rating = p.get("rating", "NA")
+                total = p.get("user_ratings_total", "NA")
+                pid = p.get("place_id", "")
+                label = f"{name} | {addr} | ⭐{rating} ({total})"
+                options.append(label)
+                id_map[label] = pid
+
+            q_selected_label = st.selectbox("选择目标商家（Google Nearby）", options, key="q_sel_place")
+            q_selected_place_id = id_map.get(q_selected_label)
+
+            if st.button("拉取商家详情（Google Place Details）", disabled=not google_key, key="q_btn_details"):
+                if not q_selected_place_id:
+                    st.error("请先选择一个商家。")
+                else:
+                    details = google_place_details(q_selected_place_id, google_key)
+                    if not details:
+                        st.error("拉取详情失败。")
+                    else:
+                        st.session_state["q_place_details"] = details
+                        q_place_details = details
+                        st.success("已拉取商家详情。")
+
+        if q_place_details:
+            st.markdown("### 商家信息确认（可编辑）")
+            q_name = st.text_input("商家名称", value=q_place_details.get("name", ""), key="q_name")
+            q_addr2 = st.text_input("商家地址", value=q_place_details.get("formatted_address", q_address), key="q_addr2")
+            st.caption(f"Google：⭐{q_place_details.get('rating','')}（{q_place_details.get('user_ratings_total','')} reviews）")
+
+            loc = (q_place_details.get("geometry", {}) or {}).get("location", {}) or {}
+            b_lat = float(loc.get("lat")) if loc.get("lat") is not None else None
+            b_lng = float(loc.get("lng")) if loc.get("lng") is not None else None
+
+            with st.expander("自动获取商圈画像（US Census ACS, tract proxy）", expanded=True):
+                if b_lat and b_lng:
+                    if st.button("获取 ACS 商圈画像（自动）", key="q_btn_acs"):
+                        tract_info = census_tract_from_latlng(b_lat, b_lng)
+                        if not tract_info:
+                            st.warning("无法获取 tract 信息（Census geocoder）。")
+                        else:
+                            acs_data = acs_5y_profile(tract_info["STATE"], tract_info["COUNTY"], tract_info["TRACT"], year=2023)
+                            st.session_state["q_tract_info"] = tract_info
+                            st.session_state["q_acs_data"] = acs_data
+                            st.success("已获取 ACS 数据（tract 级别代理）。")
+                else:
+                    st.info("无法从 Place Details 获取坐标，无法调用 ACS。")
+
+                q_tract_info = st.session_state.get("q_tract_info", None)
+                q_acs_data = st.session_state.get("q_acs_data", None)
+                if q_acs_data:
+                    st.write({
+                        "ACS Year": q_acs_data.get("year"),
+                        "Geography": q_acs_data.get("name"),
+                        "Population (tract)": None if q_acs_data.get("pop_total") is None else int(q_acs_data.get("pop_total")),
+                        "Median HH Income": None if q_acs_data.get("median_income") is None else f"${int(q_acs_data.get('median_income')):,}",
+                        "Median Age": q_acs_data.get("median_age"),
+                        "% Asian (proxy)": None if q_acs_data.get("pct_asian") is None else f"{q_acs_data.get('pct_asian')*100:.1f}%",
+                        "% Renter (proxy)": None if q_acs_data.get("pct_renter") is None else f"{q_acs_data.get('pct_renter')*100:.1f}%",
+                        "Note": "ACS 为 tract 级别代理，作为商圈画像方向性参考。"
+                    })
+
+            st.markdown("### 一键生成“快速诊断报告”")
+            if st.button("生成快速诊断报告", type="primary", disabled=not openai_key, key="q_btn_gen"):
+                progress = st.progress(0)
+                status = st.empty()
+
+                def step(pct: int, msg: str):
+                    progress.progress(pct)
+                    status.info(msg)
+
+                step(10, "抓取附近同类竞对（样本）…")
+                competitors_sample: List[Dict[str, Any]] = []
+                try:
+                    if b_lat and b_lng:
+                        pt = None if business_type == "all" else business_type
+                        kw = q_keyword.strip() or None
+                        comp_places = google_nearby_places(b_lat, b_lng, google_key, radius_m=q_nearby_radius_m, place_type=pt, keyword=kw)
+                        self_pid = q_place_details.get("place_id")
+                        for cp in comp_places:
+                            if cp.get("place_id") == self_pid:
+                                continue
+                            competitors_sample.append({
+                                "name": cp.get("name"),
+                                "vicinity": cp.get("vicinity"),
+                                "rating": cp.get("rating"),
+                                "user_ratings_total": cp.get("user_ratings_total"),
+                                "types": cp.get("types", [])[:6],
+                            })
+                except Exception:
+                    competitors_sample = []
+
+                step(55, "生成短诊断正文（可交付）…")
+                q_tract_info = st.session_state.get("q_tract_info", None)
+                q_acs_data = st.session_state.get("q_acs_data", None)
+
+                prompt = build_quick_diag_prompt(
+                    business_name=q_name.strip(),
+                    address=q_addr2.strip(),
+                    place_details=q_place_details,
+                    acs_data=q_acs_data,
+                    tract_info=q_tract_info,
+                    competitors=competitors_sample,
+                    lang=report_lang
+                )
+                quick_text = openai_text(prompt, openai_key, model=model, temperature=0.35)
+                quick_text = sanitize_text(quick_text)
+
+                report_date = dt.datetime.now().strftime("%m/%d/%Y")
+                inputs = ReportInputs(
+                    report_date=report_date,
+                    restaurant_cn=q_name.strip(),
+                    restaurant_en=q_name.strip(),
+                    address=q_addr2.strip(),
+                    radius_miles=0.0,
+                    own_menu_meta={"label":"N/A","files":[],"extracted":{"items":[],"promos":[],"notes":[]}},
+                    orders_meta={"files":[],"note":"N/A"},
+                    competitors=[],
+                    extra_business_context="Quick Diagnostic Report",
+                    acs=q_acs_data,
+                    tract_info=q_tract_info,
+                    restaurant_google=q_place_details,
+                    charts={},
+                )
+
+                st.session_state["q_quick_text"] = quick_text
+                st.session_state["q_quick_inputs"] = inputs
+
+                step(100, "完成：可预览与生成PDF。")
+                status.success("快速诊断报告已生成。")
+
+            q_quick_text = st.session_state.get("q_quick_text", "")
+            q_quick_inputs = st.session_state.get("q_quick_inputs", None)
+
+            if q_quick_text and q_quick_inputs:
+                st.subheader("快速诊断报告预览（可编辑）")
+                edited = st.text_area("诊断正文", value=q_quick_text, height=420, key="q_quick_editor")
+                st.session_state["q_quick_text"] = sanitize_text(edited)
+
+                st.subheader("生成 PDF（复用原模板）")
+                if st.button("生成 PDF（快速诊断报告）", type="primary", key="q_btn_pdf"):
+                    with st.spinner("正在生成 PDF..."):
+                        pdf_path = render_pdf(st.session_state["q_quick_text"], q_quick_inputs)
+                    st.success("PDF 生成完成。")
+                    with open(pdf_path, "rb") as f:
+                        st.download_button("下载 PDF", f, file_name=os.path.basename(pdf_path), mime="application/pdf")
+                    st.caption(f"输出路径：{pdf_path}")
+            else:
+                st.info("先搜索商家并生成快速诊断报告，这里会出现预览与PDF下载。")
+
+
+# =========================================================
+# Tab B: Menu Optimizer (NEW switches)
 # =========================================================
 with tab_menu:
-    st.subheader("菜单智能调整（价格锚点 + 心理定价 + 同行对标 + 套餐重构）")
-    st.caption("逻辑：先识别菜单 → 引入竞对菜单 → AI 判断整体是否偏高 → 先调价 → 再组套餐 → 输出可直接上架的完整菜单结构（CSV/JSON）。")
+    st.subheader("菜单智能调整（价格锚点 + 心理定价 + 同行对标 + 套餐重构 + 抽佣测算）")
+    st.caption("流程：识别菜单 → 引入竞对菜单 → 判断价带偏差 → 先调价 → 再组套餐 → 输出可直接上架的菜单结构（含堂食/外卖分层与抽佣净到手估算）。")
 
     colA, colB = st.columns([1, 1])
     with colA:
         menu_rest_name = st.text_input("门店名称（用于菜单输出）", value="My Restaurant", key="menu_rest_name")
         menu_rest_addr = st.text_input("门店地址（用于市场对标提示）", value="San Francisco, CA", key="menu_rest_addr")
         menu_lang = st.selectbox("输出菜单语言", ["中文", "English"], index=0, key="menu_lang")
+
+        st.markdown("### 策略目标（新增）")
+        objective_ui = st.radio(
+            "选择一个主目标",
+            ["优先引流品（低毛利高转化）", "优先利润最大化"],
+            index=0,
+            key="objective_ui"
+        )
+        objective_mode = "acquisition" if "引流" in objective_ui else "profit"
+
+        st.markdown("### 价格分层（新增）")
+        price_layering = st.checkbox(
+            "启用堂食价/外卖价分层（推荐）",
+            value=True,
+            key="price_layering"
+        )
+
+        st.markdown("### 平台抽佣（新增）")
+        commission_choice = st.selectbox("平台抽佣（用于外卖价测算）", ["25%", "30%", "自定义"], index=1, key="commission_choice")
+        if commission_choice == "自定义":
+            commission_rate = st.number_input("自定义抽佣比例（0~0.6）", min_value=0.0, max_value=0.6, value=0.30, step=0.01, key="commission_custom")
+        else:
+            commission_rate = 0.25 if commission_choice == "25%" else 0.30
+
+        st.caption("提示：如果你想更贴近现实，可在外卖价里把 packaging / delivery fee / promo cost 作为 notes 提示，后续可扩展为成本模型。")
 
     with colB:
         own_menu_files2 = st.file_uploader(
@@ -1263,14 +1599,14 @@ with tab_menu:
             accept_multiple_files=True,
             key="own_menu_files_optimizer"
         )
-        st.markdown("**竞对菜单上传（新增按钮）**")
+        st.markdown("**竞对菜单上传（必备）**")
         comp_menu_files2 = st.file_uploader(
             "上传竞对菜单（可多家多文件）",
             type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
             accept_multiple_files=True,
             key="comp_menu_files_optimizer"
         )
-        st.caption("建议：至少上传 1-2 家竞对菜单，这样“同行价带”才靠谱。")
+        st.caption("建议：至少 1-2 家竞对菜单；如果没有竞对数据，AI 会提示“数据不足”，并采取更保守的价带策略。")
 
     if st.button("生成智能菜单结构", type="primary", disabled=not openai_key, key="btn_opt_menu"):
         progress = st.progress(0)
@@ -1292,7 +1628,7 @@ with tab_menu:
         step(55, "计算同行价带与偏高判断…")
         market_summary = summarize_market_prices(own_df2, [comp_df2])
 
-        step(75, "AI 进行：调价 → 组套餐 → 完整菜单结构输出…")
+        step(75, "AI 进行：调价 → 组套餐 → 分层定价 → 抽佣净到手估算…")
         try:
             optimized_df = generate_optimized_menu_df(
                 api_key=openai_key,
@@ -1302,7 +1638,10 @@ with tab_menu:
                 own_menu_meta=own_meta2,
                 competitor_menu_metas=[comp_meta2],
                 market_summary=market_summary,
-                lang=menu_lang
+                lang=menu_lang,
+                objective_mode=objective_mode,
+                commission_rate=float(commission_rate),
+                price_layering=bool(price_layering),
             )
         except Exception as e:
             st.error(f"生成失败：{str(e)[:300]}")
@@ -1311,14 +1650,24 @@ with tab_menu:
         st.session_state["optimized_menu_df"] = optimized_df
         st.session_state["optimized_market_summary"] = market_summary
         st.session_state["optimized_raw_metas"] = {"own": own_meta2, "comp": comp_meta2}
+        st.session_state["optimized_settings"] = {
+            "objective_mode": objective_mode,
+            "commission_rate": float(commission_rate),
+            "price_layering": bool(price_layering),
+            "lang": menu_lang,
+        }
 
         step(100, "完成。")
-        status.success("已生成智能菜单结构（包含：价格锚点/心理定价/同行对标/套餐）。")
+        status.success("已生成智能菜单结构（含：价格锚点/心理定价/同行对标/套餐/堂食外卖分层/抽佣净到手估算）。")
 
     optimized_df = st.session_state.get("optimized_menu_df", None)
     if isinstance(optimized_df, pd.DataFrame) and not optimized_df.empty:
         st.subheader("智能菜单预览（可直接下载）")
         st.dataframe(optimized_df, use_container_width=True, height=520)
+
+        settings = st.session_state.get("optimized_settings", {})
+        with st.expander("本次策略参数（用于复盘/对齐）", expanded=False):
+            st.json(settings)
 
         market_summary = st.session_state.get("optimized_market_summary", {})
         with st.expander("同行价带摘要（用于解释为什么要调价/怎么锚点）", expanded=False):
