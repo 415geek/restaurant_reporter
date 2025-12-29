@@ -445,6 +445,99 @@ def acs_5y_profile(state: str, county: str, tract: str, year: int = 2023) -> Opt
     out["pct_renter"] = (renter / occ_total) if occ_total > 0 else None
     return out
 
+# =========================================================
+# FIX: Trade Area ACS (radius -> multiple tracts -> aggregate)
+# =========================================================
+def tigerweb_tracts_near_point(lat: float, lng: float, radius_miles: float) -> List[Tuple[str, str, str]]:
+    """
+    Return distinct (STATE, COUNTY, TRACT) tuples within radius using TIGERweb ArcGIS.
+    """
+    url = "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Tracts_Blocks/MapServer/2/query"
+    params = {
+        "where": "1=1",
+        "geometry": f"{lng},{lat}",
+        "geometryType": "esriGeometryPoint",
+        "inSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "distance": int(radius_miles * 1609.344),
+        "units": "esriSRUnit_Meter",
+        "outFields": "STATE,COUNTY,TRACT",
+        "returnGeometry": "false",
+        "f": "json",
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    feats = r.json().get("features", []) or []
+    tracts = []
+    for f in feats:
+        a = f.get("attributes", {}) or {}
+        s = str(a.get("STATE", "")).zfill(2)
+        c = str(a.get("COUNTY", "")).zfill(3)
+        t = str(a.get("TRACT", "")).zfill(6)
+        if s and c and t:
+            tracts.append((s, c, t))
+    return list(set(tracts))
+
+def aggregate_trade_area_acs(lat: float, lng: float, radius_miles: float, year: int = 2023) -> Optional[Dict[str, Any]]:
+    """
+    Aggregate ACS across all tracts in radius.
+    Income/age are population-weighted proxies (not perfect but far better than single tract).
+    """
+    tracts = tigerweb_tracts_near_point(lat, lng, radius_miles)
+    if not tracts:
+        return None
+
+    rows = []
+    for s, c, t in tracts:
+        prof = acs_5y_profile(s, c, t, year=year)
+        if prof and prof.get("pop_total") is not None:
+            rows.append(prof)
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    pop = df["pop_total"].fillna(0).sum()
+    if pop <= 0:
+        return None
+
+    # sums
+    asian = df["asian"].fillna(0).sum()
+    white = df["white"].fillna(0).sum()
+    black = df["black"].fillna(0).sum()
+    hisp = df["hispanic"].fillna(0).sum()
+
+    owner = df["owner_occ"].fillna(0).sum()
+    renter = df["renter_occ"].fillna(0).sum()
+    occ = owner + renter
+
+    # weighted proxies
+    w_income = (df["median_income"].fillna(0) * df["pop_total"].fillna(0)).sum() / pop
+    w_age = (df["median_age"].fillna(0) * df["pop_total"].fillna(0)).sum() / pop
+
+    return {
+        "year": year,
+        "trade_area_radius_miles": radius_miles,
+        "tract_count": int(df.shape[0]),
+        "population_est": int(pop),
+        "pct_asian": float(asian / pop),
+        "pct_white": float(white / pop),
+        "pct_black": float(black / pop),
+        "pct_hispanic": float(hisp / pop),
+        "pct_owner": float(owner / occ) if occ > 0 else None,
+        "pct_renter": float(renter / occ) if occ > 0 else None,
+        "median_income_proxy": int(w_income) if w_income else None,
+        "median_age_proxy": round(float(w_age), 1) if w_age else None,
+        "note": "Trade area ACS aggregated across tracts within radius. Income & age are population-weighted proxies.",
+        "tracts": tracts[:200],  # 防止太长
+    }
+
+
+
+
+
+
+
 
 # =========================================================
 # OpenAI Responses API (minimal wrapper)
