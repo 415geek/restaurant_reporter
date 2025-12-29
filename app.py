@@ -1,11 +1,10 @@
 # app.py
 # AuraInsight 报告生成器（Trade Area & Growth Diagnostic）
-# NOTE: This is a single-file Streamlit app assembled from the code you provided,
-# with Tab 3 replaced by the upgraded "粘贴/上传/链接" 菜单智能调整老板端体验。
+# NOTE: Single-file Streamlit app. Patched to FIX: "Expanders may not be nested inside other expanders."
+# Key fix: avoid any expander inside another expander. Debug sections are rendered via checkbox + container.
 
 import os
 import re
-import html
 import io
 import json
 import time
@@ -448,334 +447,6 @@ def acs_5y_profile(state: str, county: str, tract: str, year: int = 2023) -> Opt
 
 
 # =========================================================
-# Trade Area Population (radius-based, using Block Groups)
-# =========================================================
-TIGER_BG_QUERY_URL = "https://tigerweb.geo.census.gov/arcgis/rest/services/Generalized_TAB2020/Tracts_Blocks/MapServer/2/query"
-
-def tiger_blockgroups_within_radius(lat: float, lng: float, radius_m: int) -> List[Dict[str, Any]]:
-    """
-    Return Census Block Groups whose polygons intersect a circle around (lat,lng) within radius_m meters.
-    Uses TIGERweb ArcGIS REST (Generalized_TAB2020/Tracts_Blocks/MapServer/2 = Block Groups).
-    """
-    params = {
-        "f": "json",
-        "where": "1=1",
-        "geometry": f"{lng},{lat}",
-        "geometryType": "esriGeometryPoint",
-        "inSR": 4326,
-        "spatialRel": "esriSpatialRelIntersects",
-        "distance": int(radius_m),
-        "units": "esriSRUnit_Meter",
-        "outFields": "GEOID,STATE,COUNTY,TRACT,BLKGRP,NAME",
-        "returnGeometry": "false",
-        "resultRecordCount": 2000
-    }
-    r = requests.get(TIGER_BG_QUERY_URL, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    feats = data.get("features", []) or []
-    out = []
-    for f in feats:
-        a = (f.get("attributes") or {})
-        geoid = str(a.get("GEOID") or "").strip()
-        if not geoid:
-            continue
-        out.append({
-            "GEOID": geoid,
-            "STATE": str(a.get("STATE") or "").zfill(2),
-            "COUNTY": str(a.get("COUNTY") or "").zfill(3),
-            "TRACT": str(a.get("TRACT") or ""),
-            "BLKGRP": str(a.get("BLKGRP") or ""),
-            "NAME": a.get("NAME", "")
-        })
-    return out
-
-def decennial_pl_2020_pop_blockgroup(state: str, county: str, tract: str, blkgrp: str) -> Optional[int]:
-    """
-    2020 Decennial Census PL 94-171: Total population (P1_001N) at block group level.
-    """
-    url = "https://api.census.gov/data/2020/dec/pl"
-    params = {
-        "get": "NAME,P1_001N",
-        "for": f"block group:{blkgrp}",
-        "in": f"state:{state} county:{county} tract:{tract}",
-    }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if not data or len(data) < 2:
-        return None
-    try:
-        return int(float(data[1][1]))
-    except Exception:
-        return None
-
-def acs_5y_profile_blockgroup(state: str, county: str, tract: str, blkgrp: str, year: int = 2023) -> Optional[Dict[str, Any]]:
-    """
-    ACS 5-year estimates at block group level.
-    Same variable set as tract profile, but geography is block group.
-    """
-    vars_map = {
-        "pop_total": "B01003_001E",
-        "median_income": "B19013_001E",
-        "median_age": "B01002_001E",
-        "white": "B02001_002E",
-        "black": "B02001_003E",
-        "asian": "B02001_005E",
-        "hispanic": "B03003_003E",
-        "owner_occ": "B25003_002E",
-        "renter_occ": "B25003_003E",
-    }
-    get_vars = ",".join(["NAME"] + list(vars_map.values()))
-    url = f"https://api.census.gov/data/{year}/acs/acs5"
-    params = {
-        "get": get_vars,
-        "for": f"block group:{blkgrp}",
-        "in": f"state:{state} county:{county} tract:{tract}"
-    }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if not data or len(data) < 2:
-        return None
-    headers, values = data[0], data[1]
-    row = dict(zip(headers, values))
-
-    def to_num(x):
-        try:
-            return float(x)
-        except Exception:
-            return None
-
-    out = {"year": year, "name": row.get("NAME",""), "state": state, "county": county, "tract": tract, "blkgrp": blkgrp}
-    for k, v in vars_map.items():
-        out[k] = to_num(row.get(v))
-    return out
-# --- Tract-based radius query (more stable than block groups) ---
-TIGER_TRACT_QUERY_URL = "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Tracts_Blocks/MapServer/1/query"
-
-@st.cache_data(show_spinner=False, ttl=60*60*24)
-def tiger_tracts_within_radius(lat: float, lng: float, radius_miles: float) -> list[dict]:
-    """Return TIGERweb Census Tracts whose geometry intersects a radius buffer around (lat,lng)."""
-    radius_m = float(radius_miles) * 1609.34
-    params = {
-        "f": "json",
-        "where": "1=1",
-        "geometry": f"{lng},{lat}",
-        "geometryType": "esriGeometryPoint",
-        "inSR": 4326,
-        "spatialRel": "esriSpatialRelIntersects",
-        "distance": radius_m,
-        "units": "esriSRUnit_Meter",
-        "outFields": "STATE,COUNTY,TRACT,NAME,GEOID",
-        "returnGeometry": "false",
-    }
-    r = requests.get(TIGER_TRACT_QUERY_URL, params=params, timeout=30)
-    r.raise_for_status()
-    js = r.json()
-    feats = js.get("features") or []
-    out = []
-    for f in feats:
-        a = (f or {}).get("attributes") or {}
-        state = str(a.get("STATE") or "").zfill(2)
-        county = str(a.get("COUNTY") or "").zfill(3)
-        tract = str(a.get("TRACT") or "").zfill(6)
-        geoid = a.get("GEOID") or (state + county + tract)
-        out.append({"state": state, "county": county, "tract": tract, "geoid": geoid, "name": a.get("NAME")})
-    # de-dup
-    dedup = {(x["state"], x["county"], x["tract"]): x for x in out}
-    return list(dedup.values())
-
-@st.cache_data(show_spinner=False, ttl=60*60*24)
-def build_radius_trade_area_profile_tracts(lat: float, lng: float, radius_miles: float, year: int = 2023) -> dict:
-    """Compute trade-area stats by summing ACS 5-year tract totals for tracts intersecting the radius."""
-    tracts = tiger_tracts_within_radius(lat, lng, radius_miles)
-    if not tracts:
-        return {"radius_miles": radius_miles, "method": "tracts_intersect_radius", "tracts": [], "acs_year": year}
-
-    # Aggregate count-like variables (pop, race, tenure). Medians are approximated by population-weighted average (not true median).
-    agg = {
-        "pop_total": 0,
-        "race_white": 0,
-        "race_black": 0,
-        "race_asian": 0,
-        "race_hisp": 0,
-        "housing_owner": 0,
-        "housing_renter": 0,
-        "median_age_wavg_num": 0.0,
-        "median_income_wavg_num": 0.0,
-        "tract_count": len(tracts),
-    }
-
-    tract_profiles = []
-    for t in tracts[:200]:
-        try:
-            p = acs_5y_profile(t["state"], t["county"], t["tract"], year=year)
-            tract_profiles.append({"geoid": t["geoid"], "name": t.get("name"), **p})
-            pop = int(p.get("pop_total") or 0)
-            agg["pop_total"] += pop
-            agg["race_white"] += int(p.get("race_white") or 0)
-            agg["race_black"] += int(p.get("race_black") or 0)
-            agg["race_asian"] += int(p.get("race_asian") or 0)
-            agg["race_hisp"] += int(p.get("race_hisp") or 0)
-            agg["housing_owner"] += int(p.get("housing_owner") or 0)
-            agg["housing_renter"] += int(p.get("housing_renter") or 0)
-
-            med_age = float(p.get("median_age") or 0) if p.get("median_age") is not None else 0.0
-            med_inc = float(p.get("median_income") or 0) if p.get("median_income") is not None else 0.0
-            agg["median_age_wavg_num"] += med_age * pop
-            agg["median_income_wavg_num"] += med_inc * pop
-        except Exception:
-            continue
-
-    pop_total = agg["pop_total"] or 0
-    median_age_est = (agg["median_age_wavg_num"] / pop_total) if pop_total > 0 else None
-    median_income_est = (agg["median_income_wavg_num"] / pop_total) if pop_total > 0 else None
-
-    # Shares
-    def _pct(x):
-        return round((x / pop_total) * 100, 1) if pop_total > 0 else None
-
-    out = {
-        "radius_miles": radius_miles,
-        "method": "ACS_5y_tract_sum_intersect_radius",
-        "acs_year": year,
-        "tracts": [{"geoid": t["geoid"], "name": t.get("name")} for t in tracts],
-        "pop_total": pop_total,
-        "race_pct_asian": _pct(agg["race_asian"]),
-        "race_pct_white": _pct(agg["race_white"]),
-        "race_pct_hisp": _pct(agg["race_hisp"]),
-        "race_pct_black": _pct(agg["race_black"]),
-        "median_age_est": round(median_age_est, 1) if median_age_est is not None else None,
-        "median_household_income_est": int(round(median_income_est)) if median_income_est is not None else None,
-        "owner_households": agg["housing_owner"],
-        "renter_households": agg["housing_renter"],
-        "profiles_sampled": len(tract_profiles),
-    }
-    return out
-
-
-
-def build_radius_trade_area_profile(lat: float, lng: float, radius_miles: float, acs_year: int = 2023) -> Dict[str, Any]:
-    """
-    Build a radius-based trade-area profile by:
-    1) finding intersecting block groups within radius
-    2) summing 2020 decennial population (more "actual") across those block groups
-    3) summing ACS 5y estimates across those block groups (more "current-ish")
-    Notes:
-    - This is still an approximation because we include whole block groups whose polygons intersect the circle.
-      For a "true within-circle" population you need polygon intersection area-weighting at block/ block-group level.
-    """
-
-    # Prefer tract-sum approach (ACS 5-year) for radius population & demographics.
-    # This is much more stable than block-group/decennial proxies, and aligns with how most consultants size trade areas.
-    try:
-        prof = build_radius_trade_area_profile_tracts(lat, lng, radius_miles, year=year)
-        if int(prof.get("pop_total") or 0) > 0:
-            return prof
-    except Exception:
-        # Fall back to block-group method below
-        pass
-
-    radius_m = int(float(radius_miles) * 1609.34)
-    bgs = tiger_blockgroups_within_radius(lat, lng, radius_m)
-    profile = {
-        "radius_miles": float(radius_miles),
-        "radius_meters": radius_m,
-        "block_groups_count": len(bgs),
-        "method": "Sum block groups intersecting radius circle (approx). Decennial=2020 PL P1_001N; Current=ACS 5y estimates.",
-        "pop_2020_sum": None,
-        "pop_acs_sum": None,
-        "median_age_weighted": None,
-        "median_income_weighted": None,
-        "race_counts_acs": {},
-        "tenure_counts_acs": {},
-        "pct_asian_acs": None,
-        "pct_white_acs": None,
-        "pct_black_acs": None,
-        "pct_hispanic_acs": None,
-        "pct_owner_acs": None,
-        "pct_renter_acs": None,
-        "notes": []
-    }
-    if not bgs:
-        profile["notes"].append("No block groups returned by TIGERweb for this point/radius.")
-        return profile
-
-    pop2020_total = 0
-    pop2020_n = 0
-
-    # ACS additive totals
-    acs_pop_total = 0.0
-    race = {"white": 0.0, "black": 0.0, "asian": 0.0, "hispanic": 0.0}
-    tenure = {"owner_occ": 0.0, "renter_occ": 0.0}
-
-    # Weighted approximations
-    age_num = 0.0
-    inc_num = 0.0
-    w_age = 0.0
-    w_inc = 0.0
-
-    for bg in bgs[:2000]:
-        stt, cty, tr, grp = bg["STATE"], bg["COUNTY"], bg["TRACT"], bg["BLKGRP"]
-
-        # 2020 pop
-        try:
-            p20 = decennial_pl_2020_pop_blockgroup(stt, cty, tr, grp)
-            if p20 is not None:
-                pop2020_total += int(p20)
-                pop2020_n += 1
-        except Exception as e:
-            profile["notes"].append(f"2020 pop fetch failed for BG {bg.get('GEOID')}: {str(e)[:120]}")
-
-        # ACS profile
-        try:
-            a = acs_5y_profile_blockgroup(stt, cty, tr, grp, year=acs_year)
-            if a and a.get("pop_total") is not None:
-                p = float(a.get("pop_total") or 0.0)
-                acs_pop_total += p
-                for k in race:
-                    race[k] += float(a.get(k) or 0.0)
-                for k in tenure:
-                    tenure[k] += float(a.get(k) or 0.0)
-
-                # weighted approximations for medians
-                if a.get("median_age") is not None:
-                    age_num += float(a["median_age"]) * p
-                    w_age += p
-                if a.get("median_income") is not None:
-                    inc_num += float(a["median_income"]) * p
-                    w_inc += p
-        except Exception as e:
-            profile["notes"].append(f"ACS fetch failed for BG {bg.get('GEOID')}: {str(e)[:120]}")
-
-    if pop2020_n > 0:
-        profile["pop_2020_sum"] = int(pop2020_total)
-    if acs_pop_total > 0:
-        profile["pop_acs_sum"] = int(round(acs_pop_total))
-        profile["race_counts_acs"] = {k: int(round(v)) for k, v in race.items()}
-        profile["tenure_counts_acs"] = {k: int(round(v)) for k, v in tenure.items()}
-
-        profile["pct_asian_acs"] = (race["asian"] / acs_pop_total) if acs_pop_total else None
-        profile["pct_white_acs"] = (race["white"] / acs_pop_total) if acs_pop_total else None
-        profile["pct_black_acs"] = (race["black"] / acs_pop_total) if acs_pop_total else None
-        profile["pct_hispanic_acs"] = (race["hispanic"] / acs_pop_total) if acs_pop_total else None
-
-        occ_total = tenure["owner_occ"] + tenure["renter_occ"]
-        profile["pct_owner_acs"] = (tenure["owner_occ"] / occ_total) if occ_total else None
-        profile["pct_renter_acs"] = (tenure["renter_occ"] / occ_total) if occ_total else None
-
-    if w_age > 0:
-        profile["median_age_weighted"] = round(age_num / w_age, 1)
-    if w_inc > 0:
-        profile["median_income_weighted"] = int(round(inc_num / w_inc))
-
-    if profile["block_groups_count"] < 6:
-        profile["notes"].append("Few block groups intersect radius; population could be under/over-estimated depending on boundary alignment.")
-
-    return profile
-
-# =========================================================
 # OpenAI Responses API (minimal wrapper)
 # =========================================================
 def openai_responses(api_key: str, payload: Dict[str, Any], timeout: int = 240) -> Dict[str, Any]:
@@ -794,63 +465,6 @@ def openai_text(prompt: str, api_key: str, model: str, temperature: float = 0.25
             if c.get("type") == "output_text":
                 out.append(c.get("text", ""))
     return "\n".join(out).strip()
-
-
-
-def openai_text_stream(prompt: str, api_key: str, model: str, temperature: float = 0.3, max_output_tokens: int = 4500):
-    """Yield incremental text from OpenAI Responses API using server-sent events."""
-    if not api_key:
-        raise RuntimeError("Missing OpenAI API key.")
-    url = "https://api.openai.com/v1/responses"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "input": prompt,
-        "temperature": temperature,
-        "max_output_tokens": int(max_output_tokens),
-        "stream": True,
-    }
-    with requests.post(url, headers=headers, json=payload, stream=True, timeout=180) as r:
-        r.raise_for_status()
-        for raw in r.iter_lines(decode_unicode=True):
-            if not raw:
-                continue
-            line = raw.strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[len("data:"):].strip()
-            if data == "[DONE]":
-                break
-            try:
-                evt = json.loads(data)
-            except Exception:
-                continue
-
-            t = evt.get("type")
-            if t == "response.output_text.delta":
-                delta = evt.get("delta") or ""
-                if delta:
-                    yield delta
-            elif t == "response.output_text.done":
-                txt = evt.get("text") or ""
-                if txt:
-                    yield txt
-
-def openai_text_live(prompt: str, api_key: str, model: str, ui_placeholder, ui_log_placeholder=None, temperature: float = 0.3):
-    """Stream LLM output into a Streamlit placeholder; returns final text."""
-    acc = []
-    try:
-        for d in openai_text_stream(prompt, api_key=api_key, model=model, temperature=temperature):
-            acc.append(d)
-            ui_placeholder.markdown(
-                """<div style="white-space:pre-wrap">%s</div>""" % html.escape("".join(acc)),
-                unsafe_allow_html=True,
-            )
-        return "".join(acc).strip()
-    except Exception as e:
-        if ui_log_placeholder is not None:
-            ui_log_placeholder.warning(f"流式输出不可用，已自动切换为普通模式：{str(e)[:160]}")
-        return openai_text(prompt, api_key=api_key, model=model, temperature=temperature)
 
 
 def _file_to_text_summary(uploaded_file) -> str:
@@ -883,6 +497,7 @@ def _file_to_text_summary(uploaded_file) -> str:
             return "Excel读取失败。"
 
     return ""
+
 
 def extract_menu_with_openai(files: List[Any], api_key: str, model: str, label: str) -> Dict[str, Any]:
     if not files:
@@ -1452,7 +1067,7 @@ def build_prompt(inputs: ReportInputs, lang: str) -> str:
         "trade_area": {
             "tract_info": inputs.tract_info,
             "acs": inputs.acs,
-            "assumption_note": "优先使用 acs.radius_profile（按半径汇总：Block Group 近似 + 2020 Decennial 人口口径 + ACS 估计）；tract 仅作兜底/行政区标识。报告必须明确估算方法与误差来源。"
+            "assumption_note": "ACS 为 tract 级别代理，作为商圈画像的方向性参考；报告必须明确这个假设并给出风险提示。"
         },
         "own_menu": inputs.own_menu_meta,
         "orders_meta": inputs.orders_meta,
@@ -1543,20 +1158,20 @@ MULTI_SYSTEM_STYLE = """
   - 1–3 个关键增长瓶颈。
 
 1. 需求与客群结构（Trade Area / Customer Fundamentals）
-1.1 区域/目标客群画像
+1.1 区域/目标客群画像（2024-2025最新的人口数量，年龄分布，收入情况等）
 - 结合可用数据描述目标客群，使用“区间 + 相对占比”表达。
 1.2 消费/使用行为特征
 - 判断业务属于：高流量冲动型/低流动高复购型/项目制决策型/长期合同型等。
 - 每个判断后必须给出 1–2 句支撑依据（数据或事实），写出因果逻辑。
 
 2. 品牌与渠道/平台结构（Brand & Channel Ecosystem）
-2.1 品牌资产与信任结构：经营年限、认知度、口碑、复购/续约趋势；判断阶段（新品牌试错/老品牌效率优化）。
+2.1 品牌资产与信任结构：经营年限（通过yelp 或google相关评论找出）、认知度、口碑、复购/续约趋势；判断阶段（新品牌试错/老品牌效率优化）。
 2.2 渠道/平台角色拆解（Role-based View）
 - 列出主要获客与成交渠道，并说明：用户动机、战略意义（利润锚点/新客入口/曝光入口/订单基盘/活跃度来源）。
 - 强调“多渠道不是分散，而是分工”，给出结构判断并说明理由。
 
 3. 竞争格局与相对位置（Competitive Landscape）
-3.1 主要竞对列表：3–5 个典型竞品（同城同品类/同平台垂类/同客群替代）。
+3.1 主要竞对列表：3–5 个典型竞品（同城同品类/同平台垂类/同客群替代），根据本店具体售卖菜品，找出符合要求的竞对信息。
 - 建议用表格对比：经营年限、渠道覆盖、品牌信任、价格带、目标客群结构、优势与风险点。
 3.2 关键洞察：竞争本质是“结构更优”，明确自身优势与短板各 2–3 点。
 
@@ -1609,7 +1224,7 @@ def build_quick_prompt(place_details: Dict[str, Any],
         "trade_area": {
             "tract_info": tract_info,
             "acs": acs_data,
-            "assumption_note": "优先使用 acs.radius_profile（按半径汇总：Block Group 近似）；tract 仅作兜底/行政区标识。"
+            "assumption_note": "ACS 为 tract 级别代理，作为区域画像方向性参考。"
         },
         "extra_business_context": extra_context.strip(),
         "current_date": dt.datetime.now().strftime("%Y-%m-%d"),
@@ -1883,49 +1498,50 @@ with tab_food:
                 key="food_own_menu_files"
             )
 
+        # --- IMPORTANT PATCH: no nested expanders.
+        # This expander is allowed; inside it we must not add another expander.
         with st.expander("自动获取商圈人口/收入/年龄/族裔/租住比例（US Census ACS）", expanded=True):
+            # Use checkbox for debug details (instead of nested expander)
+            show_debug = st.checkbox("显示 Trade Area 计算细节（debug）", value=False, key="food_show_trade_area_debug")
+
             if rest_lat and rest_lng:
-                
-                if st.button("获取商圈人口画像（按半径汇总）", key="food_btn_acs"):
-                    # 1) tract（用于兜底与行政区标识）
+                if st.button("获取 ACS 商圈画像（自动）", key="food_btn_acs"):
                     tract_info = census_tract_from_latlng(rest_lat, rest_lng)
                     if not tract_info:
                         st.warning("无法获取 tract 信息（Census geocoder）。")
                     else:
-                        # 2) tract ACS（作为兜底）
+                        # keep year default stable; you can change as needed
                         acs_data = acs_5y_profile(tract_info["STATE"], tract_info["COUNTY"], tract_info["TRACT"], year=2023)
-
-                        # 3) 半径汇总：基于 Block Group 真实人口口径（2020 Decennial）+ 当前估计（ACS 5y）
-                        try:
-                            radius_profile = build_radius_trade_area_profile(
-                                lat=rest_lat,
-                                lng=rest_lng,
-                                radius_miles=radius_miles,
-                                acs_year=2023
-                            )
-                        except Exception as e:
-                            radius_profile = {"error": str(e)[:200]}
-
-                        if isinstance(acs_data, dict):
-                            acs_data["radius_profile"] = radius_profile  # 写入，供报告使用
-                        else:
-                            acs_data = {"radius_profile": radius_profile}
-
                         st.session_state["food_tract_info"] = tract_info
                         st.session_state["food_acs_data"] = acs_data
-                        st.success("已获取商圈画像（半径汇总 + tract 兜底）。")
+                        st.success("已获取 ACS 数据（tract 级别代理）。")
             else:
                 st.info("未能从 Google Place Details 获取坐标，无法调用 ACS。")
 
             tract_info = st.session_state.get("food_tract_info", None)
             acs_data = st.session_state.get("food_acs_data", None)
+
             if acs_data:
                 st.write({
-                    "ACS Year (tract fallback)": acs_data.get("year"),
-                    "Geography (tract fallback)": acs_data.get("name"),
-                    "Population (tract fallback)": None if acs_data.get("pop_total") is None else int(acs_data.get("pop_total")),
-                    "Radius Profile (preferred)": (acs_data.get("radius_profile") or {}),
-                    "Note": "优先使用 Radius Profile：按半径汇总（Block Group 近似）的人口口径；tract 仅作为兜底与行政区标识。"
+                    "ACS Year": acs_data.get("year"),
+                    "Geography": acs_data.get("name"),
+                    "Population (tract)": None if acs_data.get("pop_total") is None else int(acs_data.get("pop_total")),
+                    "Median HH Income": None if acs_data.get("median_income") is None else f"${int(acs_data.get('median_income')):,}",
+                    "Median Age": acs_data.get("median_age"),
+                    "% Asian (proxy)": None if acs_data.get("pct_asian") is None else f"{acs_data.get('pct_asian')*100:.1f}%",
+                    "% Renter (proxy)": None if acs_data.get("pct_renter") is None else f"{acs_data.get('pct_renter')*100:.1f}%",
+                    "Note": "ACS 为 tract 级别代理，作为商圈画像方向性参考。"
+                })
+
+            if show_debug:
+                st.markdown("#### Trade Area 计算细节（debug）")
+                st.write({
+                    "rest_lat": rest_lat,
+                    "rest_lng": rest_lng,
+                    "tract_info": tract_info,
+                    "acs_available": bool(acs_data),
+                    "radius_miles_ui": radius_miles,
+                    "nearby_radius_m_ui": nearby_radius_m,
                 })
 
         with st.expander("上传订单报表（CSV，可选：用于时段/客单/热销/KPI）", expanded=False):
@@ -1937,7 +1553,6 @@ with tab_food:
             orders_meta = {"files": [], "note": "No uploads"}
 
         st.subheader("Step 3｜生成报告内容（先预览可编辑，再生成 PDF）")
-        show_live = st.checkbox("显示 AI 生成过程（流式输出）", value=True, key="food_show_live")
         if st.button("生成报告内容", type="primary", disabled=not openai_key, key="food_btn_gen_report"):
             progress = st.progress(0)
             status = st.empty()
@@ -1976,13 +1591,7 @@ with tab_food:
             )
 
             prompt = build_prompt(inputs, report_lang)
-            step(65, "调用模型生成报告（流式输出）…" if show_live else "调用模型生成报告…")
-            live_placeholder = st.empty() if show_live else None
-            log_placeholder = st.empty()
-            if show_live:
-                report_text = openai_text_live(prompt, api_key=openai_key, model=model, ui_placeholder=live_placeholder, ui_log_placeholder=log_placeholder, temperature=0.25)
-            else:
-                report_text = openai_text(prompt, openai_key, model=model, temperature=0.25)
+            report_text = openai_text(prompt, openai_key, model=model, temperature=0.25)
             report_text = sanitize_text(report_text)
 
             step(80, "扩写补全（确保足够细）…")
@@ -2002,7 +1611,6 @@ with tab_food:
             edited = st.text_area("报告正文", value=report_text, height=520, key="food_report_editor")
             st.session_state["food_report_text"] = sanitize_text(edited)
 
-            
             st.subheader("图表预览（将自动附在 PDF 后面）")
             if report_inputs.charts:
                 cols = st.columns(2)
@@ -2011,13 +1619,7 @@ with tab_food:
                     with cols[idx % 2]:
                         st.caption(k)
                         if isinstance(v, (bytes, bytearray)) and len(v) > 50:
-                            try:
-                                from PIL import Image
-                                import io as _io
-                                img = Image.open(_io.BytesIO(v))
-                                st.image(img, use_container_width=True)
-                            except Exception as _e:
-                                st.warning(f"{k} 图表预览失败（已跳过）：{str(_e)[:120]}")
+                            st.image(v, use_container_width=True)
                         else:
                             st.warning(f"{k} 图表数据缺失，已跳过。")
                     idx += 1
@@ -2030,8 +1632,7 @@ with tab_food:
                     pdf_path = render_pdf(st.session_state["food_report_text"], report_inputs)
                 st.success("PDF 生成完成。")
                 with open(pdf_path, "rb") as f:
-                    pdf_bytes = f.read()
-                st.download_button("下载 PDF", pdf_bytes, file_name=os.path.basename(pdf_path), mime="application/pdf")
+                    st.download_button("下载 PDF", f, file_name=os.path.basename(pdf_path), mime="application/pdf")
                 st.caption(f"输出路径：{pdf_path}")
         else:
             st.info("先生成报告内容后，这里会出现预览与PDF下载。")
@@ -2107,6 +1708,8 @@ with tab_quick:
             extra_context = st.text_area("补充业务背景（可选）", value="", height=140, key="quick_ctx")
 
         with st.expander("自动获取区域画像（US Census ACS）", expanded=True):
+            show_debug = st.checkbox("显示 Trade Area 计算细节（debug）", value=False, key="quick_show_trade_area_debug")
+
             if q_lat and q_lng:
                 if st.button("获取 ACS 区域画像（自动）", key="quick_btn_acs"):
                     tract_info = census_tract_from_latlng(q_lat, q_lng)
@@ -2131,7 +1734,16 @@ with tab_quick:
                     "Median Age": acs_data.get("median_age"),
                     "% Asian (proxy)": None if acs_data.get("pct_asian") is None else f"{acs_data.get('pct_asian')*100:.1f}%",
                     "% Renter (proxy)": None if acs_data.get("pct_renter") is None else f"{acs_data.get('pct_renter')*100:.1f}%",
-                    "Note": "优先使用 acs.radius_profile（按半径汇总：Block Group 近似）；tract 仅作兜底/行政区标识。"
+                    "Note": "ACS 为 tract 级别代理，作为区域画像方向性参考。"
+                })
+
+            if show_debug:
+                st.markdown("#### Trade Area 计算细节（debug）")
+                st.write({
+                    "q_lat": q_lat,
+                    "q_lng": q_lng,
+                    "tract_info": tract_info,
+                    "acs_available": bool(acs_data),
                 })
 
         st.subheader("Step 3｜生成快速诊断报告内容（先预览可编辑，再生成 PDF）")
@@ -2203,8 +1815,7 @@ with tab_quick:
                     pdf_path = render_pdf(st.session_state["quick_report_text"], q_inputs)
                 st.success("PDF 生成完成。")
                 with open(pdf_path, "rb") as f:
-                    pdf_bytes = f.read()
-                st.download_button("下载 PDF", pdf_bytes, file_name=os.path.basename(pdf_path), mime="application/pdf")
+                    st.download_button("下载 PDF", f, file_name=os.path.basename(pdf_path), mime="application/pdf")
                 st.caption(f"输出路径：{pdf_path}")
         else:
             st.info("先生成报告内容后，这里会出现预览与PDF下载。")
@@ -2502,4 +2113,3 @@ with tab_menu:
             )
     else:
         st.info("请先导入【你的菜单】（任一方式），然后点击生成。")
-
