@@ -1,9 +1,11 @@
 # app.py
 # AuraInsight 报告生成器（Trade Area & Growth Diagnostic）
-# FINAL: trade area population fix (multi-tract aggregation) + OpenAI streaming output + safer chart display
+# NOTE: This is a single-file Streamlit app assembled from the code you provided,
+# with Tab 3 replaced by the upgraded "粘贴/上传/链接" 菜单智能调整老板端体验。
 
 import os
 import re
+import html
 import io
 import json
 import time
@@ -11,8 +13,9 @@ import math
 import hmac
 import base64
 import datetime as dt
+import textwrap
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple, Iterable
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 import streamlit as st
@@ -148,15 +151,10 @@ class ReportInputs:
     competitors: List[CompetitorInput]
     extra_business_context: str
 
-    # legacy tract level (still kept)
+    acs: Optional[Dict[str, Any]]
     tract_info: Optional[Dict[str, Any]]
-    acs_tract: Optional[Dict[str, Any]]
-
-    # NEW: aggregated trade area
-    trade_area_acs: Optional[Dict[str, Any]]
-    trade_area_debug: Optional[Dict[str, Any]]
-
     restaurant_google: Dict[str, Any]
+
     charts: Dict[str, bytes]
 
 
@@ -211,8 +209,6 @@ def draw_bg(c: canvas.Canvas, bg_path: str):
         c.drawImage(bg_path, 0, 0, width=PAGE_W, height=PAGE_H, mask="auto")
 
 def sanitize_text(text: str) -> str:
-    if not text:
-        return ""
     text = text.replace("```", "").replace("`", "")
     text = text.replace("•", "-")
     text = re.sub(r'^\s{0,3}#{1,6}\s*', '', text, flags=re.M)
@@ -220,6 +216,11 @@ def sanitize_text(text: str) -> str:
     return text.strip()
 
 def wrap_lines_by_pdf_width(text: str, font_name: str, font_size: int, max_width: float) -> List[str]:
+    """
+    Wrap text to fit PDF width using reportlab stringWidth.
+    - English: prefer space wrapping, but will hard-break very long tokens (urls/long words).
+    - Chinese/No-space lines: char-by-char safe wrapping.
+    """
     out: List[str] = []
     if not text:
         return out
@@ -300,7 +301,7 @@ def wrap_lines_by_pdf_width(text: str, font_name: str, font_size: int, max_width
     return out
 
 def parse_sections(text: str) -> List[Tuple[str, str]]:
-    text = (text or "").strip()
+    text = text.strip()
     if not text:
         return []
     sections = []
@@ -334,43 +335,6 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 def df_to_json_bytes(df: pd.DataFrame) -> bytes:
     return df.to_json(orient="records", force_ascii=False, indent=2).encode("utf-8")
-
-
-# =========================================================
-# Geography helpers (NEW)
-# =========================================================
-EARTH_R_KM = 6371.0088
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
-    return 2 * EARTH_R_KM * math.asin(math.sqrt(a))
-
-def destination_point(lat: float, lon: float, bearing_deg: float, dist_km: float) -> Tuple[float, float]:
-    # great-circle destination
-    br = math.radians(bearing_deg)
-    lat1 = math.radians(lat)
-    lon1 = math.radians(lon)
-    dr = dist_km / EARTH_R_KM
-    lat2 = math.asin(math.sin(lat1)*math.cos(dr) + math.cos(lat1)*math.sin(dr)*math.cos(br))
-    lon2 = lon1 + math.atan2(math.sin(br)*math.sin(dr)*math.cos(lat1), math.cos(dr)-math.sin(lat1)*math.sin(lat2))
-    return (math.degrees(lat2), (math.degrees(lon2)+540) % 360 - 180)
-
-def sample_points_in_circle(lat: float, lon: float, radius_km: float, rings: int = 4, per_ring: int = 16) -> List[Tuple[float, float]]:
-    # include center + rings with evenly distributed bearings
-    pts = [(lat, lon)]
-    if rings <= 0:
-        return pts
-    for r in range(1, rings+1):
-        frac = r / rings
-        dist = radius_km * frac
-        n = max(8, int(per_ring * frac))
-        for i in range(n):
-            b = (360.0 * i) / n
-            pts.append(destination_point(lat, lon, b, dist))
-    return pts
 
 
 # =========================================================
@@ -419,7 +383,7 @@ def google_place_details(place_id: str, api_key: str) -> Dict[str, Any]:
 
 
 # =========================================================
-# Census ACS (tract-level fetch + NEW aggregated trade area)
+# Census ACS
 # =========================================================
 def census_tract_from_latlng(lat: float, lng: float) -> Optional[Dict[str, str]]:
     url = "https://geocoding.geo.census.gov/geocoder/geographies/coordinates"
@@ -434,7 +398,6 @@ def census_tract_from_latlng(lat: float, lng: float) -> Optional[Dict[str, str]]
         return None
 
 def acs_5y_profile(state: str, county: str, tract: str, year: int = 2023) -> Optional[Dict[str, Any]]:
-    # key counts + medians
     vars_map = {
         "pop_total": "B01003_001E",
         "median_income": "B19013_001E",
@@ -483,117 +446,337 @@ def acs_5y_profile(state: str, county: str, tract: str, year: int = 2023) -> Opt
     out["pct_renter"] = (renter / occ_total) if occ_total > 0 else None
     return out
 
-def aggregate_trade_area_acs(lat: float, lng: float, radius_miles: float, year: int = 2023,
-                             rings: int = 4, per_ring: int = 18, request_delay_s: float = 0.0) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    """
-    NEW: “实际商圈人口统计”的近似实现
-    - 在半径内采样多点 → 每点反查 tract → 去重 tract → 拉取每 tract ACS → 人口加权聚合
-    - 注意：median_income / median_age 用人口加权均值（近似），不是严格合并中位数
-    """
-    debug = {"radius_miles": radius_miles, "year": year, "rings": rings, "per_ring": per_ring,
-             "points": 0, "unique_tracts": 0, "tracts": [], "errors": []}
-
-    radius_km = radius_miles * 1.609344
-    pts = sample_points_in_circle(lat, lng, radius_km, rings=rings, per_ring=per_ring)
-    debug["points"] = len(pts)
-
-    tract_keys = {}
-    for (plat, plng) in pts:
-        try:
-            tract = census_tract_from_latlng(plat, plng)
-            if tract and tract.get("STATE") and tract.get("COUNTY") and tract.get("TRACT"):
-                key = (tract["STATE"], tract["COUNTY"], tract["TRACT"])
-                tract_keys[key] = tract
-        except Exception as e:
-            debug["errors"].append(f"tract_lookup_failed: {str(e)[:120]}")
-        if request_delay_s:
-            time.sleep(request_delay_s)
-
-    debug["unique_tracts"] = len(tract_keys)
-    debug["tracts"] = [{"state": k[0], "county": k[1], "tract": k[2], "name": v.get("NAME","")} for k, v in tract_keys.items()][:300]
-
-    if not tract_keys:
-        return None, debug
-
-    tracts_acs = []
-    for key, tract in tract_keys.items():
-        try:
-            acs = acs_5y_profile(key[0], key[1], key[2], year=year)
-            if acs and acs.get("pop_total") is not None and acs.get("pop_total") > 0:
-                tracts_acs.append(acs)
-        except Exception as e:
-            debug["errors"].append(f"acs_failed_{key}: {str(e)[:120]}")
-        if request_delay_s:
-            time.sleep(request_delay_s)
-
-    if not tracts_acs:
-        return None, debug
-
-    # aggregate
-    pop_sum = sum([a.get("pop_total", 0.0) or 0.0 for a in tracts_acs])
-    if pop_sum <= 0:
-        return None, debug
-
-    def sum_field(field: str) -> float:
-        return float(sum([(a.get(field, 0.0) or 0.0) for a in tracts_acs]))
-
-    # counts
-    white = sum_field("white")
-    black = sum_field("black")
-    asian = sum_field("asian")
-    hispanic = sum_field("hispanic")
-    owner = sum_field("owner_occ")
-    renter = sum_field("renter_occ")
-
-    # weighted medians (approx)
-    def wavg(field: str) -> Optional[float]:
-        num = 0.0
-        den = 0.0
-        for a in tracts_acs:
-            v = a.get(field, None)
-            p = a.get("pop_total", 0.0) or 0.0
-            if v is None or p <= 0:
-                continue
-            num += float(v) * float(p)
-            den += float(p)
-        return (num/den) if den > 0 else None
-
-    median_income_w = wavg("median_income")
-    median_age_w = wavg("median_age")
-
-    occ_total = owner + renter
-    out = {
-        "year": year,
-        "method": "multi-tract aggregation via sampled points within radius",
-        "radius_miles": radius_miles,
-        "center": {"lat": lat, "lng": lng},
-        "tracts_used": len(tracts_acs),
-        "pop_total": pop_sum,
-        "white": white,
-        "black": black,
-        "asian": asian,
-        "hispanic": hispanic,
-        "pct_white": (white / pop_sum) if pop_sum > 0 else None,
-        "pct_black": (black / pop_sum) if pop_sum > 0 else None,
-        "pct_asian": (asian / pop_sum) if pop_sum > 0 else None,
-        "pct_hispanic": (hispanic / pop_sum) if pop_sum > 0 else None,
-        "owner_occ": owner,
-        "renter_occ": renter,
-        "pct_owner": (owner / occ_total) if occ_total > 0 else None,
-        "pct_renter": (renter / occ_total) if occ_total > 0 else None,
-        "median_income_wavg": median_income_w,
-        "median_age_wavg": median_age_w,
-        "notes": [
-            "Population / race / owner-renter are aggregated (sum) across tracts discovered within the radius.",
-            "Median income / median age are population-weighted averages of tract medians (approximation).",
-            "This is much closer to 'trade area' reality than a single tract, but still an approximation."
-        ],
-    }
-    return out, debug
-
 
 # =========================================================
-# OpenAI Responses API (streaming)
+# Trade Area Population (radius-based, using Block Groups)
+# =========================================================
+TIGER_BG_QUERY_URL = "https://tigerweb.geo.census.gov/arcgis/rest/services/Generalized_TAB2020/Tracts_Blocks/MapServer/2/query"
+
+def tiger_blockgroups_within_radius(lat: float, lng: float, radius_m: int) -> List[Dict[str, Any]]:
+    """
+    Return Census Block Groups whose polygons intersect a circle around (lat,lng) within radius_m meters.
+    Uses TIGERweb ArcGIS REST (Generalized_TAB2020/Tracts_Blocks/MapServer/2 = Block Groups).
+    """
+    params = {
+        "f": "json",
+        "where": "1=1",
+        "geometry": f"{lng},{lat}",
+        "geometryType": "esriGeometryPoint",
+        "inSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "distance": int(radius_m),
+        "units": "esriSRUnit_Meter",
+        "outFields": "GEOID,STATE,COUNTY,TRACT,BLKGRP,NAME",
+        "returnGeometry": "false",
+        "resultRecordCount": 2000
+    }
+    r = requests.get(TIGER_BG_QUERY_URL, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    feats = data.get("features", []) or []
+    out = []
+    for f in feats:
+        a = (f.get("attributes") or {})
+        geoid = str(a.get("GEOID") or "").strip()
+        if not geoid:
+            continue
+        out.append({
+            "GEOID": geoid,
+            "STATE": str(a.get("STATE") or "").zfill(2),
+            "COUNTY": str(a.get("COUNTY") or "").zfill(3),
+            "TRACT": str(a.get("TRACT") or ""),
+            "BLKGRP": str(a.get("BLKGRP") or ""),
+            "NAME": a.get("NAME", "")
+        })
+    return out
+
+def decennial_pl_2020_pop_blockgroup(state: str, county: str, tract: str, blkgrp: str) -> Optional[int]:
+    """
+    2020 Decennial Census PL 94-171: Total population (P1_001N) at block group level.
+    """
+    url = "https://api.census.gov/data/2020/dec/pl"
+    params = {
+        "get": "NAME,P1_001N",
+        "for": f"block group:{blkgrp}",
+        "in": f"state:{state} county:{county} tract:{tract}",
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if not data or len(data) < 2:
+        return None
+    try:
+        return int(float(data[1][1]))
+    except Exception:
+        return None
+
+def acs_5y_profile_blockgroup(state: str, county: str, tract: str, blkgrp: str, year: int = 2023) -> Optional[Dict[str, Any]]:
+    """
+    ACS 5-year estimates at block group level.
+    Same variable set as tract profile, but geography is block group.
+    """
+    vars_map = {
+        "pop_total": "B01003_001E",
+        "median_income": "B19013_001E",
+        "median_age": "B01002_001E",
+        "white": "B02001_002E",
+        "black": "B02001_003E",
+        "asian": "B02001_005E",
+        "hispanic": "B03003_003E",
+        "owner_occ": "B25003_002E",
+        "renter_occ": "B25003_003E",
+    }
+    get_vars = ",".join(["NAME"] + list(vars_map.values()))
+    url = f"https://api.census.gov/data/{year}/acs/acs5"
+    params = {
+        "get": get_vars,
+        "for": f"block group:{blkgrp}",
+        "in": f"state:{state} county:{county} tract:{tract}"
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if not data or len(data) < 2:
+        return None
+    headers, values = data[0], data[1]
+    row = dict(zip(headers, values))
+
+    def to_num(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    out = {"year": year, "name": row.get("NAME",""), "state": state, "county": county, "tract": tract, "blkgrp": blkgrp}
+    for k, v in vars_map.items():
+        out[k] = to_num(row.get(v))
+    return out
+# --- Tract-based radius query (more stable than block groups) ---
+TIGER_TRACT_QUERY_URL = "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Tracts_Blocks/MapServer/1/query"
+
+@st.cache_data(show_spinner=False, ttl=60*60*24)
+def tiger_tracts_within_radius(lat: float, lng: float, radius_miles: float) -> list[dict]:
+    """Return TIGERweb Census Tracts whose geometry intersects a radius buffer around (lat,lng)."""
+    radius_m = float(radius_miles) * 1609.34
+    params = {
+        "f": "json",
+        "where": "1=1",
+        "geometry": f"{lng},{lat}",
+        "geometryType": "esriGeometryPoint",
+        "inSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "distance": radius_m,
+        "units": "esriSRUnit_Meter",
+        "outFields": "STATE,COUNTY,TRACT,NAME,GEOID",
+        "returnGeometry": "false",
+    }
+    r = requests.get(TIGER_TRACT_QUERY_URL, params=params, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    feats = js.get("features") or []
+    out = []
+    for f in feats:
+        a = (f or {}).get("attributes") or {}
+        state = str(a.get("STATE") or "").zfill(2)
+        county = str(a.get("COUNTY") or "").zfill(3)
+        tract = str(a.get("TRACT") or "").zfill(6)
+        geoid = a.get("GEOID") or (state + county + tract)
+        out.append({"state": state, "county": county, "tract": tract, "geoid": geoid, "name": a.get("NAME")})
+    # de-dup
+    dedup = {(x["state"], x["county"], x["tract"]): x for x in out}
+    return list(dedup.values())
+
+@st.cache_data(show_spinner=False, ttl=60*60*24)
+def build_radius_trade_area_profile_tracts(lat: float, lng: float, radius_miles: float, year: int = 2023) -> dict:
+    """Compute trade-area stats by summing ACS 5-year tract totals for tracts intersecting the radius."""
+    tracts = tiger_tracts_within_radius(lat, lng, radius_miles)
+    if not tracts:
+        return {"radius_miles": radius_miles, "method": "tracts_intersect_radius", "tracts": [], "acs_year": year}
+
+    # Aggregate count-like variables (pop, race, tenure). Medians are approximated by population-weighted average (not true median).
+    agg = {
+        "pop_total": 0,
+        "race_white": 0,
+        "race_black": 0,
+        "race_asian": 0,
+        "race_hisp": 0,
+        "housing_owner": 0,
+        "housing_renter": 0,
+        "median_age_wavg_num": 0.0,
+        "median_income_wavg_num": 0.0,
+        "tract_count": len(tracts),
+    }
+
+    tract_profiles = []
+    for t in tracts[:200]:
+        try:
+            p = acs_5y_profile(t["state"], t["county"], t["tract"], year=year)
+            tract_profiles.append({"geoid": t["geoid"], "name": t.get("name"), **p})
+            pop = int(p.get("pop_total") or 0)
+            agg["pop_total"] += pop
+            agg["race_white"] += int(p.get("race_white") or 0)
+            agg["race_black"] += int(p.get("race_black") or 0)
+            agg["race_asian"] += int(p.get("race_asian") or 0)
+            agg["race_hisp"] += int(p.get("race_hisp") or 0)
+            agg["housing_owner"] += int(p.get("housing_owner") or 0)
+            agg["housing_renter"] += int(p.get("housing_renter") or 0)
+
+            med_age = float(p.get("median_age") or 0) if p.get("median_age") is not None else 0.0
+            med_inc = float(p.get("median_income") or 0) if p.get("median_income") is not None else 0.0
+            agg["median_age_wavg_num"] += med_age * pop
+            agg["median_income_wavg_num"] += med_inc * pop
+        except Exception:
+            continue
+
+    pop_total = agg["pop_total"] or 0
+    median_age_est = (agg["median_age_wavg_num"] / pop_total) if pop_total > 0 else None
+    median_income_est = (agg["median_income_wavg_num"] / pop_total) if pop_total > 0 else None
+
+    # Shares
+    def _pct(x):
+        return round((x / pop_total) * 100, 1) if pop_total > 0 else None
+
+    out = {
+        "radius_miles": radius_miles,
+        "method": "ACS_5y_tract_sum_intersect_radius",
+        "acs_year": year,
+        "tracts": [{"geoid": t["geoid"], "name": t.get("name")} for t in tracts],
+        "pop_total": pop_total,
+        "race_pct_asian": _pct(agg["race_asian"]),
+        "race_pct_white": _pct(agg["race_white"]),
+        "race_pct_hisp": _pct(agg["race_hisp"]),
+        "race_pct_black": _pct(agg["race_black"]),
+        "median_age_est": round(median_age_est, 1) if median_age_est is not None else None,
+        "median_household_income_est": int(round(median_income_est)) if median_income_est is not None else None,
+        "owner_households": agg["housing_owner"],
+        "renter_households": agg["housing_renter"],
+        "profiles_sampled": len(tract_profiles),
+    }
+    return out
+
+
+
+def build_radius_trade_area_profile(lat: float, lng: float, radius_miles: float, acs_year: int = 2023) -> Dict[str, Any]:
+    """
+    Build a radius-based trade-area profile by:
+    1) finding intersecting block groups within radius
+    2) summing 2020 decennial population (more "actual") across those block groups
+    3) summing ACS 5y estimates across those block groups (more "current-ish")
+    Notes:
+    - This is still an approximation because we include whole block groups whose polygons intersect the circle.
+      For a "true within-circle" population you need polygon intersection area-weighting at block/ block-group level.
+    """
+
+    # Prefer tract-sum approach (ACS 5-year) for radius population & demographics.
+    # This is much more stable than block-group/decennial proxies, and aligns with how most consultants size trade areas.
+    try:
+        prof = build_radius_trade_area_profile_tracts(lat, lng, radius_miles, year=year)
+        if int(prof.get("pop_total") or 0) > 0:
+            return prof
+    except Exception:
+        # Fall back to block-group method below
+        pass
+
+    radius_m = int(float(radius_miles) * 1609.34)
+    bgs = tiger_blockgroups_within_radius(lat, lng, radius_m)
+    profile = {
+        "radius_miles": float(radius_miles),
+        "radius_meters": radius_m,
+        "block_groups_count": len(bgs),
+        "method": "Sum block groups intersecting radius circle (approx). Decennial=2020 PL P1_001N; Current=ACS 5y estimates.",
+        "pop_2020_sum": None,
+        "pop_acs_sum": None,
+        "median_age_weighted": None,
+        "median_income_weighted": None,
+        "race_counts_acs": {},
+        "tenure_counts_acs": {},
+        "pct_asian_acs": None,
+        "pct_white_acs": None,
+        "pct_black_acs": None,
+        "pct_hispanic_acs": None,
+        "pct_owner_acs": None,
+        "pct_renter_acs": None,
+        "notes": []
+    }
+    if not bgs:
+        profile["notes"].append("No block groups returned by TIGERweb for this point/radius.")
+        return profile
+
+    pop2020_total = 0
+    pop2020_n = 0
+
+    # ACS additive totals
+    acs_pop_total = 0.0
+    race = {"white": 0.0, "black": 0.0, "asian": 0.0, "hispanic": 0.0}
+    tenure = {"owner_occ": 0.0, "renter_occ": 0.0}
+
+    # Weighted approximations
+    age_num = 0.0
+    inc_num = 0.0
+    w_age = 0.0
+    w_inc = 0.0
+
+    for bg in bgs[:2000]:
+        stt, cty, tr, grp = bg["STATE"], bg["COUNTY"], bg["TRACT"], bg["BLKGRP"]
+
+        # 2020 pop
+        try:
+            p20 = decennial_pl_2020_pop_blockgroup(stt, cty, tr, grp)
+            if p20 is not None:
+                pop2020_total += int(p20)
+                pop2020_n += 1
+        except Exception as e:
+            profile["notes"].append(f"2020 pop fetch failed for BG {bg.get('GEOID')}: {str(e)[:120]}")
+
+        # ACS profile
+        try:
+            a = acs_5y_profile_blockgroup(stt, cty, tr, grp, year=acs_year)
+            if a and a.get("pop_total") is not None:
+                p = float(a.get("pop_total") or 0.0)
+                acs_pop_total += p
+                for k in race:
+                    race[k] += float(a.get(k) or 0.0)
+                for k in tenure:
+                    tenure[k] += float(a.get(k) or 0.0)
+
+                # weighted approximations for medians
+                if a.get("median_age") is not None:
+                    age_num += float(a["median_age"]) * p
+                    w_age += p
+                if a.get("median_income") is not None:
+                    inc_num += float(a["median_income"]) * p
+                    w_inc += p
+        except Exception as e:
+            profile["notes"].append(f"ACS fetch failed for BG {bg.get('GEOID')}: {str(e)[:120]}")
+
+    if pop2020_n > 0:
+        profile["pop_2020_sum"] = int(pop2020_total)
+    if acs_pop_total > 0:
+        profile["pop_acs_sum"] = int(round(acs_pop_total))
+        profile["race_counts_acs"] = {k: int(round(v)) for k, v in race.items()}
+        profile["tenure_counts_acs"] = {k: int(round(v)) for k, v in tenure.items()}
+
+        profile["pct_asian_acs"] = (race["asian"] / acs_pop_total) if acs_pop_total else None
+        profile["pct_white_acs"] = (race["white"] / acs_pop_total) if acs_pop_total else None
+        profile["pct_black_acs"] = (race["black"] / acs_pop_total) if acs_pop_total else None
+        profile["pct_hispanic_acs"] = (race["hispanic"] / acs_pop_total) if acs_pop_total else None
+
+        occ_total = tenure["owner_occ"] + tenure["renter_occ"]
+        profile["pct_owner_acs"] = (tenure["owner_occ"] / occ_total) if occ_total else None
+        profile["pct_renter_acs"] = (tenure["renter_occ"] / occ_total) if occ_total else None
+
+    if w_age > 0:
+        profile["median_age_weighted"] = round(age_num / w_age, 1)
+    if w_inc > 0:
+        profile["median_income_weighted"] = int(round(inc_num / w_inc))
+
+    if profile["block_groups_count"] < 6:
+        profile["notes"].append("Few block groups intersect radius; population could be under/over-estimated depending on boundary alignment.")
+
+    return profile
+
+# =========================================================
+# OpenAI Responses API (minimal wrapper)
 # =========================================================
 def openai_responses(api_key: str, payload: Dict[str, Any], timeout: int = 240) -> Dict[str, Any]:
     url = "https://api.openai.com/v1/responses"
@@ -612,54 +795,64 @@ def openai_text(prompt: str, api_key: str, model: str, temperature: float = 0.25
                 out.append(c.get("text", ""))
     return "\n".join(out).strip()
 
-def openai_text_stream(prompt: str, api_key: str, model: str, temperature: float = 0.25) -> Iterable[str]:
-    """
-    Stream output_text chunks from Responses API.
-    UI 会实时看到生成内容（不是“内部思考”，而是最终输出的实时增量）。
-    """
-    url = "https://api.openai.com/v1/responses"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-    }
-    payload = {"model": model, "input": prompt, "temperature": temperature, "stream": True}
 
-    with requests.post(url, headers=headers, json=payload, stream=True, timeout=600) as r:
+
+def openai_text_stream(prompt: str, api_key: str, model: str, temperature: float = 0.3, max_output_tokens: int = 4500):
+    """Yield incremental text from OpenAI Responses API using server-sent events."""
+    if not api_key:
+        raise RuntimeError("Missing OpenAI API key.")
+    url = "https://api.openai.com/v1/responses"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "input": prompt,
+        "temperature": temperature,
+        "max_output_tokens": int(max_output_tokens),
+        "stream": True,
+    }
+    with requests.post(url, headers=headers, json=payload, stream=True, timeout=180) as r:
         r.raise_for_status()
-        buffer = ""
-        for raw_line in r.iter_lines(decode_unicode=True):
-            if not raw_line:
+        for raw in r.iter_lines(decode_unicode=True):
+            if not raw:
                 continue
-            line = raw_line.strip()
+            line = raw.strip()
             if not line.startswith("data:"):
                 continue
-            data_str = line[len("data:"):].strip()
-            if data_str == "[DONE]":
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
                 break
             try:
-                obj = json.loads(data_str)
+                evt = json.loads(data)
             except Exception:
                 continue
 
-            # Try to extract incremental text
-            # Different deployments may emit slightly different shapes; we handle common cases.
-            # Case A: {type:"response.output_text.delta", delta:"..."}
-            t = ""
-            if isinstance(obj, dict):
-                if obj.get("type") in ("response.output_text.delta", "response.output_text"):
-                    t = obj.get("delta") or obj.get("text") or ""
-                # Case B: full response snapshots
-                if not t and "output" in obj:
-                    # might be snapshot; we ignore to avoid duplication
-                    t = ""
-            if t:
-                yield t
+            t = evt.get("type")
+            if t == "response.output_text.delta":
+                delta = evt.get("delta") or ""
+                if delta:
+                    yield delta
+            elif t == "response.output_text.done":
+                txt = evt.get("text") or ""
+                if txt:
+                    yield txt
+
+def openai_text_live(prompt: str, api_key: str, model: str, ui_placeholder, ui_log_placeholder=None, temperature: float = 0.3):
+    """Stream LLM output into a Streamlit placeholder; returns final text."""
+    acc = []
+    try:
+        for d in openai_text_stream(prompt, api_key=api_key, model=model, temperature=temperature):
+            acc.append(d)
+            ui_placeholder.markdown(
+                """<div style="white-space:pre-wrap">%s</div>""" % html.escape("".join(acc)),
+                unsafe_allow_html=True,
+            )
+        return "".join(acc).strip()
+    except Exception as e:
+        if ui_log_placeholder is not None:
+            ui_log_placeholder.warning(f"流式输出不可用，已自动切换为普通模式：{str(e)[:160]}")
+        return openai_text(prompt, api_key=api_key, model=model, temperature=temperature)
 
 
-# =========================================================
-# Menu extraction (unchanged core)
-# =========================================================
 def _file_to_text_summary(uploaded_file) -> str:
     name = uploaded_file.name.lower()
     raw = uploaded_file.read()
@@ -808,7 +1001,95 @@ def extract_menu_with_openai(files: List[Any], api_key: str, model: str, label: 
 
 
 # =========================================================
-# Menu Stats + Charts (safer)
+# NEW: Pasted text intake + link intake helper
+# =========================================================
+def extract_menu_from_pasted_text(menu_text: str, api_key: str, model: str, label: str, platform_hint: str = "") -> Dict[str, Any]:
+    """
+    将用户粘贴的菜单文本，直接用 OpenAI 转成和 extract_menu_with_openai 一致的结构：
+    {"label":..., "files":..., "extracted":{"items":[...], "promos":[...], "notes":[...]}}
+    """
+    menu_text = (menu_text or "").strip()
+    if not menu_text:
+        return {"label": label, "files": [], "extracted": {"note": "empty text", "items": [], "promos": [], "notes": ["empty menu_text"]}}
+
+    prompt = (
+        "你是餐厅外卖菜单解析器。下面是用户粘贴的菜单文本（可能混合中英文、带价格、带分类）。\n"
+        "请提取：\n"
+        "1) 菜品名称 name（尽量保留中英文原名）\n"
+        "2) 价格 price（保留原货币符号或数值）\n"
+        "3) 分类 category（如果没有就填空字符串）\n"
+        "4) 备注 notes（如：辣度/大小份/套餐/加价项/招牌等）\n"
+        "5) 促销 promos（如买一送一/折扣/满减等）\n\n"
+        f"平台线索(platform_hint) = {platform_hint}\n"
+        "只输出 JSON，不要输出任何额外文字。\n"
+        "JSON结构："
+        "{\"items\":[{\"name\":\"\",\"price\":\"\",\"category\":\"\",\"notes\":\"\"}],"
+        "\"promos\":[\"\"],\"platform_hints\":[\"\"],\"quality_flags\":[\"\"]}\n\n"
+        "菜单原文开始：\n"
+        f"{menu_text[:65000]}\n"
+        "菜单原文结束。"
+    )
+
+    notes = []
+    try:
+        text_out = openai_text(prompt, api_key, model=model, temperature=0.2)
+        m = re.search(r"\{.*\}", text_out, flags=re.S)
+        if not m:
+            notes.append("粘贴文本解析：AI 输出无法解析为 JSON。")
+            return {"label": label, "files": [], "extracted": {"note": "parse_failed", "items": [], "promos": [], "notes": notes}}
+
+        obj = json.loads(m.group(0))
+        items = obj.get("items", []) or []
+        promos = obj.get("promos", []) or []
+        items = items[:2000]
+        promos = promos[:200]
+
+        return {
+            "label": label,
+            "files": [{"name": "pasted_menu.txt", "type": "text/plain"}],
+            "extracted": {
+                "items": items,
+                "promos": promos,
+                "notes": notes + (obj.get("quality_flags", []) or []),
+            }
+        }
+    except Exception as e:
+        notes.append(f"粘贴文本解析失败: {str(e)[:200]}")
+        return {"label": label, "files": [], "extracted": {"note": "exception", "items": [], "promos": [], "notes": notes}}
+
+
+def build_link_intake_help(link: str) -> Dict[str, Any]:
+    """
+    链接入口不直接爬虫（稳定&合规），用于：
+    - 识别平台
+    - 指引用户如何从平台复制菜单文本/导出
+    """
+    link = (link or "").strip()
+    s = link.lower()
+    platform = "Unknown"
+    if "doordash" in s:
+        platform = "DoorDash"
+    elif "ubereats" in s or "ubereat" in s:
+        platform = "UberEats"
+    elif "grubhub" in s:
+        platform = "Grubhub"
+    elif "fantuan" in s:
+        platform = "Fantuan"
+    elif "hungrypanda" in s or "panda" in s:
+        platform = "Panda"
+
+    tips = [
+        f"识别平台：{platform}",
+        "建议导入（任选其一）：",
+        "A) 打开链接 → 在平台后台/菜单页把菜品列表复制成文本 → 粘贴到【方式1：粘贴菜单文本】",
+        "B) 从平台后台导出菜单（CSV/Excel）→ 用【方式2：上传 Excel】上传",
+        "C) 如果你能拿到截图（菜单页截图）→ 直接上传图片（png/jpg）也可识别"
+    ]
+    return {"platform": platform, "tips": tips}
+
+
+# =========================================================
+# Menu Stats + Charts
 # =========================================================
 def _to_price(x: Any) -> Optional[float]:
     if x is None:
@@ -846,12 +1127,11 @@ def make_png(fig) -> bytes:
     buf.seek(0)
     return buf.read()
 
-def build_charts(own_df: pd.DataFrame) -> Dict[str, bytes]:
+def build_charts(own_df: pd.DataFrame, comps: List[Tuple[str, pd.DataFrame]]) -> Dict[str, bytes]:
     charts: Dict[str, bytes] = {}
     if own_df is None or own_df.empty:
         return charts
 
-    # Price hist
     fig = plt.figure()
     own_df["price"].dropna().plot(kind="hist", bins=18)
     plt.title("Own Menu Price Distribution")
@@ -859,7 +1139,6 @@ def build_charts(own_df: pd.DataFrame) -> Dict[str, bytes]:
     plt.ylabel("Count")
     charts["chart_own_price_hist"] = make_png(fig)
 
-    # Category bar
     fig = plt.figure()
     own_df["category"].value_counts().head(12).plot(kind="bar")
     plt.title("Own Menu Category Mix (Top 12)")
@@ -867,7 +1146,6 @@ def build_charts(own_df: pd.DataFrame) -> Dict[str, bytes]:
     plt.ylabel("Items")
     charts["chart_own_category_bar"] = make_png(fig)
 
-    # Price tiers
     bins = [0, 8, 12, 16, 20, 25, 35, 999]
     labels = ["<$8", "$8-12", "$12-16", "$16-20", "$20-25", "$25-35", "$35+"]
     tier = pd.cut(own_df["price"], bins=bins, labels=labels, include_lowest=True)
@@ -878,14 +1156,184 @@ def build_charts(own_df: pd.DataFrame) -> Dict[str, bytes]:
     plt.ylabel("Items")
     charts["chart_own_price_tiers"] = make_png(fig)
 
+    comp_rows = []
+    for name, dfc in comps:
+        if dfc is not None and not dfc.empty and dfc["price"].dropna().shape[0] >= 5:
+            comp_rows.append({"competitor": name, "median_price": float(dfc["price"].median())})
+    if comp_rows:
+        comp_df = pd.DataFrame(comp_rows).sort_values("median_price")
+        fig = plt.figure()
+        comp_df.set_index("competitor")["median_price"].plot(kind="bar")
+        plt.title("Competitor Median Price (from uploaded menus)")
+        plt.xlabel("Competitor")
+        plt.ylabel("Median Price")
+        charts["chart_comp_median_price"] = make_png(fig)
+
     return charts
 
-def safe_st_image(img_bytes: Any, caption: str = ""):
-    # Avoid Streamlit TypeError when bytes is None or unexpected
-    if isinstance(img_bytes, (bytes, bytearray)) and len(img_bytes) > 50:
-        st.image(img_bytes, use_container_width=True, caption=caption if caption else None)
+
+# =========================================================
+# Menu Optimizer
+# =========================================================
+def summarize_market_prices(own_df: pd.DataFrame, comp_dfs: List[pd.DataFrame]) -> Dict[str, Any]:
+    all_comp = pd.concat([df for df in comp_dfs if df is not None and not df.empty], ignore_index=True) if comp_dfs else pd.DataFrame()
+    out = {"own": {}, "market": {}, "notes": []}
+
+    if own_df is None or own_df.empty:
+        out["notes"].append("own_df empty")
+        return out
+
+    own_prices = own_df["price"].dropna()
+    out["own"]["median"] = float(own_prices.median()) if not own_prices.empty else None
+    out["own"]["p25"] = float(own_prices.quantile(0.25)) if not own_prices.empty else None
+    out["own"]["p75"] = float(own_prices.quantile(0.75)) if not own_prices.empty else None
+    out["own"]["count_price"] = int(own_prices.shape[0])
+
+    if all_comp.empty or all_comp["price"].dropna().empty:
+        out["notes"].append("no competitor price data")
+        return out
+
+    mkt_prices = all_comp["price"].dropna()
+    out["market"]["median"] = float(mkt_prices.median())
+    out["market"]["p25"] = float(mkt_prices.quantile(0.25))
+    out["market"]["p75"] = float(mkt_prices.quantile(0.75))
+    out["market"]["count_price"] = int(mkt_prices.shape[0])
+
+    cat_med = (all_comp.dropna(subset=["price"])
+               .groupby("category")["price"].median()
+               .sort_values(ascending=False))
+    out["market"]["category_median_top"] = cat_med.head(20).to_dict()
+
+    return out
+
+def build_menu_optimizer_prompt(
+    restaurant_name: str,
+    address: str,
+    season_hint: str,
+    own_menu_meta: Dict[str, Any],
+    competitor_menu_metas: List[Dict[str, Any]],
+    market_summary: Dict[str, Any],
+    lang: str,
+    objective_mode: str,
+    commission_rate: float,
+    price_layering: bool,
+) -> str:
+    blob = {
+        "restaurant_name": restaurant_name,
+        "address": address,
+        "season_hint": season_hint,
+        "objective_mode": objective_mode,
+        "platform_commission_rate": commission_rate,
+        "price_layering": price_layering,
+        "own_menu": own_menu_meta,
+        "competitors": competitor_menu_metas,
+        "market_summary": market_summary,
+        "pricing_rules": {
+            "psych": "用心理定价(9/9.5/8.9/18.95/19.95等) + 价格锚点(引流/主推/高毛利/形象款)构建价格梯度",
+            "step_c": "若无法识别套餐或整体偏高(对比market_summary)，先把价格调到合理价带，再组套餐，最后生成完整菜单",
+            "bundle_policy": "套餐必须有清晰节省感(省$2-$5)；要明确适用菜品、限制规则、不可叠加；给出可执行文案",
+            "commission": "外卖价必须考虑平台抽佣，避免净到手过低；堂食价可以更亲民，外卖价用于覆盖抽佣成本",
+            "objective": "若objective_mode=acquisition，则要给出1-2个引流爆款(低毛利高转化)+1个高毛利补贴；若profit则提高高毛利主推占比并减少过激折扣"
+        },
+        "output_schema": {
+            "rows": [
+                {
+                    "section": "Chef_Signature / Best_Sellers / Value_Combos / Drinks / Classic_Menu ...",
+                    "name_cn": "",
+                    "name_en": "",
+                    "name": "",
+                    "raw_category": "",
+                    "price_dine_in": 0.0,
+                    "price_delivery": 0.0,
+                    "price_old": None,
+                    "commission_rate": 0.0,
+                    "commission_fee_est": 0.0,
+                    "net_after_commission_est": 0.0,
+                    "notes": ""
+                }
+            ]
+        }
+    }
+
+    if lang == "English":
+        instruction = (
+            "You are a US delivery-market menu engineering expert.\n"
+            "Task: rebuild a FULL menu structure from extracted items.\n"
+            "Critical Step C: If bundles are missing OR overall pricing is overpriced vs market_summary, "
+            "first adjust to a reasonable price band using anchor & psychological pricing, then create bundles, "
+            "then output the final full menu.\n"
+            "You MUST incorporate competitor menus + market_summary.\n"
+            "Commission-aware: delivery price MUST account for platform commission_rate.\n"
+            "If price_layering=true, output both dine-in and delivery prices; otherwise set them equal.\n"
+            "Return JSON ONLY. No extra text.\n"
+        )
     else:
-        st.warning("图表数据缺失或格式不支持，已跳过。")
+        instruction = (
+            "你是北美外卖市场的菜单工程专家。\n"
+            "任务：根据门店菜单 + 竞对菜单 + market_summary（同行价带），重做一份可直接上架的完整菜单结构。\n"
+            "关键 Step C：如果没识别到套餐/或整体定价偏高（对比 market_summary），必须先调价到合理区间（锚点+心理定价），再组套餐，最后输出完整菜单。\n"
+            "必须考虑平台抽佣：外卖价要覆盖抽佣，避免净到手过低。\n"
+            "若 price_layering=true：输出堂食价+外卖价；否则两者相同。\n"
+            "只输出JSON，不要输出任何额外文字。\n"
+        )
+
+    return f"{instruction}\n输入JSON：\n{json.dumps(blob, ensure_ascii=False, indent=2)}"
+
+def generate_optimized_menu_df(
+    api_key: str,
+    model: str,
+    restaurant_name: str,
+    address: str,
+    own_menu_meta: Dict[str, Any],
+    competitor_menu_metas: List[Dict[str, Any]],
+    market_summary: Dict[str, Any],
+    lang: str,
+    objective_mode: str,
+    commission_rate: float,
+    price_layering: bool,
+) -> pd.DataFrame:
+    season_hint = "按北美当前季节与下个季节给上新建议，并体现到菜单分区或命名中。"
+    prompt = build_menu_optimizer_prompt(
+        restaurant_name=restaurant_name,
+        address=address,
+        season_hint=season_hint,
+        own_menu_meta=own_menu_meta,
+        competitor_menu_metas=competitor_menu_metas,
+        market_summary=market_summary,
+        lang=lang,
+        objective_mode=objective_mode,
+        commission_rate=commission_rate,
+        price_layering=price_layering,
+    )
+    text_out = openai_text(prompt, api_key, model=model, temperature=0.2)
+
+    m = re.search(r"\[.*\]", text_out, flags=re.S)
+    if not m:
+        m = re.search(r"\{.*\}", text_out, flags=re.S)
+    if not m:
+        raise ValueError("AI 输出无法解析为 JSON。")
+
+    obj = json.loads(m.group(0))
+    rows = obj.get("rows", obj if isinstance(obj, list) else [])
+    df = pd.DataFrame(rows)
+
+    cols = [
+        "section","name_cn","name_en","name","raw_category",
+        "price_dine_in","price_delivery","price_old",
+        "commission_rate","commission_fee_est","net_after_commission_est",
+        "notes"
+    ]
+    for col in cols:
+        if col not in df.columns:
+            df[col] = None
+
+    df["price_dine_in"] = pd.to_numeric(df["price_dine_in"], errors="coerce")
+    df["price_delivery"] = pd.to_numeric(df["price_delivery"], errors="coerce")
+    df["commission_rate"] = pd.to_numeric(df["commission_rate"], errors="coerce")
+    df["commission_fee_est"] = pd.to_numeric(df["commission_fee_est"], errors="coerce")
+    df["net_after_commission_est"] = pd.to_numeric(df["net_after_commission_est"], errors="coerce")
+
+    return df
 
 
 # =========================================================
@@ -913,7 +1361,7 @@ def summarize_orders(files: List[Any]) -> Dict[str, Any]:
 
 
 # =========================================================
-# Prompt (餐饮业态分析报告)
+# Prompt (餐饮业态分析报告) + language switch
 # =========================================================
 RESTAURANT_SYSTEM_STYLE = """
 你是一个餐饮行业的数据驱动增长咨询顾问，擅长对餐饮门店与餐饮品牌进行商圈诊断、平台与堂食结构分析、菜单与价格优化、虚拟品牌设计，并输出可落地执行的增长方案。报告风格参考专业餐饮咨询公司的 trade area & growth diagnostic 报告，有深度、有数据支撑，并给出具体、可拆解的执行步骤与 KPI。
@@ -921,14 +1369,68 @@ RESTAURANT_SYSTEM_STYLE = """
 请严格围绕「餐饮门店/餐饮品牌」输出报告，按照以下结构与逻辑编写（可调整小标题措辞，但保留模块和思路）：
 
 0. 报告基本信息与摘要（Executive Summary）
+- 说明：门店/品牌名称、地址或城市、业态（如：港式茶餐厅、中餐快餐、火锅、咖啡馆、甜品、轻食等）、主要就餐场景（堂食/外卖/自提比例）。
+- 用 3–6 句给出高层摘要：
+  - 所处商圈类型：例如“稳定型社区商圈”“办公室/商务型商圈”“学校/学生型商圈”“景区/高流动商圈”等。
+  - 1–3 个结构性优势（如：老字号品牌资产、多平台覆盖、厨房产能充足等）。
+  - 1–3 个关键问题/增长瓶颈（如：线上结构未最大化、价格带与客群错位、某时段空档严重等）。
+
 1. 商圈与客群结构（Trade Area & Demand Fundamentals）
+1.1 商圈界定与人口结构
+- 说明门店核心商圈半径（例如：社区店 3–4 英里，商圈步行 10–15 分钟等），并结合可用信息描述：
+  - 常住人口大致区间；
+  - 族裔结构、年龄层分布；
+  - 家庭住户占比 vs 单身/学生占比；
+  - 人口流动性（低/中/高）及其原因。
+1.2 餐饮消费行为特征
+- 判断：该商圈是高流量即食型（路过客流为主），还是信任驱动型（熟客复购为主），或者混合型。说明判断依据。
+- 说明影响复购的关键变量：例如品牌经营年限、出品稳定性、口味正宗度、家庭适配度、价格敏感度等。
+- 要求：每个判断后，用 1–2 句说明“哪些数据或事实支撑这个判断”，而不是空泛描述。
+
 2. 门店与品牌资产结构（Store & Brand Assets）
+2.1 门店基本盘
+- 门店开业年限、历史定位（如：社区老字号、新概念品牌、网红店等）。
+- 当前客源构成：附近居民、周边公司白领、学生、游客等的大致比例。
+2.2 品牌信任与复购结构
+- 说明：在核心客群中的信任度与口碑特征，是“老字号高信任高复购”，还是“新店处于试错期”。
+- 判断该门店处于哪个阶段：
+  - “结构正确但效率未最大化”；
+  - “新店需要快速验证定位与客群”；
+  - “老品牌线上化/多平台化转型期”。
+
 3. 渠道与平台生态（Dine-in, Takeout & Platform Ecosystem）
+3.1 渠道构成概览
+- 拆解：堂食；自提（电话/官网/Google）；第三方外卖平台（DoorDash/UberEats/Grubhub/饭团/HungryPanda 等）。
+- 对每个渠道给出：订单占比大致区间、人均消费估计、典型用户类型与消费动机。
+3.2 平台角色拆解（Role-based View）
+- 对每一个平台说明：商圈特征+平台主要客群；用户动机；战略意义（利润锚点/新客入口/订单基盘/活跃度来源）。
+- 强调：“多平台结构不是分散，而是分工”。给出判断：当前结构是“基础结构正确但效率未最大化”还是“过度依赖单一平台存在风险”。
+
 4. 竞争格局与相对位置（Competitive Landscape）
+4.1 竞品选择与对比
+- 选出 3–5 家主要竞品（同品类、同价格带、同平台、同商圈）。
+- 用表格对比：经营年限、平台覆盖、品牌信任资产、用户结构、价格带与主打菜、核心风险点。
+4.2 关键洞察
+- 说明竞争本质不在“菜系”，而在“平台结构与运营结构是否更优”。明确本店优势与短板各 2–3 条。
+
 5. 价格带与订单经济（Pricing & Order Economics）
+5.1 有效成交价格带：总结高频薄利区/主流成交区/高价可接受但需价值支撑/过高阻力区。
+5.2 价格敏感机制：强调价格变化的“解释空间”。
+5.3 优化方向：主攻区间、引流/高毛利/套餐化菜品、平台差异化标价策略。
+
 6. 时段与场景需求结构（Time-based & Occasion-based Demand）
+6.1 时段贡献：早餐/午餐/下午茶/晚餐/夜宵，订单与收入贡献、客单差异、用户类型差异。
+6.2 场景适配：工作日vs周末、堂食vs外卖、自提vs平台；识别放量场景/利润场景/获客心智场景。
+
 7. 菜单架构与虚拟品牌策略（Menu Architecture & Virtual Brand）
+7.1 平台区分菜单架构：不同平台不能完全同菜单；给出 SKU 数量、主打品类、活动策略、定价策略建议。
+7.2 虚拟品牌/子品牌：给 1–2 个方向；明确平台优先级、核心菜品组合与价格带、与主品牌区隔逻辑。
+7.3 虚拟品牌 KPI：订单占比、新客占比、对主品牌干扰、差评机制的纠偏动作。
+
 8. 战略结论与执行路线图（Strategic Implications & Execution Roadmap）
+8.1 关键战略判断：3–6 条有力度判断句。
+8.2 3–5 条核心增长举措：适用对象、动作内容、量化目标（转化/客单/时段收入占比/平台占比调整）。
+8.3 执行节奏与监测机制：3–6 个月节奏；平台漏斗、品类结构、时段结构；预警信号与触发调整。
 
 输出风格要求
 - 必须分章节分小节，结构类似专业「门店分析 & 增长诊断」报告。
@@ -948,18 +1450,21 @@ def build_prompt(inputs: ReportInputs, lang: str) -> str:
             "google": inputs.restaurant_google,
         },
         "trade_area": {
-            "trade_area_acs": inputs.trade_area_acs,
-            "trade_area_debug": inputs.trade_area_debug,
-            "tract_info_center": inputs.tract_info,
-            "acs_tract_center": inputs.acs_tract,
-            "assumption_note": (
-                "优先使用 trade_area_acs（半径内多 tract 聚合）作为商圈人口统计；"
-                "acs_tract_center 仅作为中心点 tract 的对照参考。"
-            )
+            "tract_info": inputs.tract_info,
+            "acs": inputs.acs,
+            "assumption_note": "优先使用 acs.radius_profile（按半径汇总：Block Group 近似 + 2020 Decennial 人口口径 + ACS 估计）；tract 仅作兜底/行政区标识。报告必须明确估算方法与误差来源。"
         },
         "own_menu": inputs.own_menu_meta,
         "orders_meta": inputs.orders_meta,
-        "competitors": [],
+        "competitors": [
+            {
+                "name_or_address": c.name_or_address,
+                "notes": c.notes,
+                "google": c.google,
+                "yelp": c.yelp,
+                "menu": c.menu_files_meta,
+            } for c in inputs.competitors
+        ],
         "extra_business_context": inputs.extra_business_context,
         "charts_available": list(inputs.charts.keys()),
         "current_date": dt.datetime.now().strftime("%Y-%m-%d"),
@@ -981,10 +1486,9 @@ Hard requirements:
 2) Headings must be numbered like "0. ...", "1. ...", "1.1 ...".
 3) Each major chapter starts with 3-6 Key Takeaways.
 4) Every recommendation must include: Action, Reason, Expected Impact, KPI, 2-week Validation method.
-5) Must interpret charts by name (chart_own_price_hist, chart_own_category_bar, chart_own_price_tiers) when available.
+5) Must interpret charts by name (chart_own_price_hist, chart_own_category_bar, chart_own_price_tiers, chart_comp_median_price) when available.
 6) Must include Data Gaps & How to Collect (as an explicit section).
 7) Must include tables where appropriate (use plain text tables, not Markdown).
-8) For population & demographics, MUST use trade_area.trade_area_acs.pop_total/pct_* as primary if available, and explain methodology briefly.
 
 Input JSON:
 {json.dumps(blob, ensure_ascii=False, indent=2)}
@@ -992,10 +1496,11 @@ Input JSON:
 Start writing now:
 """.strip()
 
-def ensure_long_enough(report_text: str, api_key: str, model: str, lang: str, min_chars: int = 14000) -> str:
+def ensure_long_enough(report_text: str, api_key: str, model: str, lang: str, min_chars: int = 16000) -> str:
     t = sanitize_text(report_text)
     if len(t) >= min_chars:
         return t
+
     if lang == "English":
         expand_prompt = f"""
 You will receive a report. Expand it significantly without changing chapter order.
@@ -1011,6 +1516,7 @@ Original:
 {t}
 原文结束。
 """.strip()
+
     try:
         t2 = openai_text(expand_prompt, api_key, model=model, temperature=0.25)
         t2 = sanitize_text(t2)
@@ -1022,7 +1528,120 @@ Original:
 
 
 # =========================================================
-# PDF Render
+# Prompt (多业态快速诊断报告)
+# =========================================================
+MULTI_SYSTEM_STYLE = """
+你是一个数据驱动的商业分析与增长咨询顾问，擅长把定性洞察和定量数据结合，输出结构清晰、逻辑严谨、可执行的业务诊断与增长方案报告。报告风格参考专业咨询公司（如 trade area & growth diagnostic 形式），要求有深度、有数据支撑、有清晰的执行路径和量化目标。
+
+请按以下原则和结构输出报告（可根据业务类型微调章节标题，但必须保留这些逻辑模块）：
+
+0. 报告基本信息
+- 简要说明：业务名称、行业/品类、所在城市/区域、分析时间范围。
+- 用 3–5 句给出高层摘要（Executive Summary）：
+  - 当前业务所处的结构性位置（例如：稳定型社区商圈、高流动商旅型、线上获客型、平台依赖型等）。
+  - 1–3 个关键结构性优势。
+  - 1–3 个关键增长瓶颈。
+
+1. 需求与客群结构（Trade Area / Customer Fundamentals）
+1.1 区域/目标客群画像
+- 结合可用数据描述目标客群，使用“区间 + 相对占比”表达。
+1.2 消费/使用行为特征
+- 判断业务属于：高流量冲动型/低流动高复购型/项目制决策型/长期合同型等。
+- 每个判断后必须给出 1–2 句支撑依据（数据或事实），写出因果逻辑。
+
+2. 品牌与渠道/平台结构（Brand & Channel Ecosystem）
+2.1 品牌资产与信任结构：经营年限、认知度、口碑、复购/续约趋势；判断阶段（新品牌试错/老品牌效率优化）。
+2.2 渠道/平台角色拆解（Role-based View）
+- 列出主要获客与成交渠道，并说明：用户动机、战略意义（利润锚点/新客入口/曝光入口/订单基盘/活跃度来源）。
+- 强调“多渠道不是分散，而是分工”，给出结构判断并说明理由。
+
+3. 竞争格局与相对位置（Competitive Landscape）
+3.1 主要竞对列表：3–5 个典型竞品（同城同品类/同平台垂类/同客群替代）。
+- 建议用表格对比：经营年限、渠道覆盖、品牌信任、价格带、目标客群结构、优势与风险点。
+3.2 关键洞察：竞争本质是“结构更优”，明确自身优势与短板各 2–3 点。
+
+4. 价格 / 产品结构与单笔经济（Pricing, Offering & Unit Economics）
+4.1 有效成交区间：多个价格带；评估成交频次、利润水平、对应客群。
+4.2 产品/方案结构：是否与支付意愿匹配；强调价格“解释空间”。
+4.3 竞对价格带监测：设计简单雷达机制，保持核心产品处于“可解释区间”。
+
+5. 时间 / 场景维度需求结构（Time / Scenario-based Demand）
+5.1 时间维度：一天/一周/项目周期；哪些时段决定规模/利润弹性。
+5.2 场景维度：工作日vs周末、线上vs线下、首次vs复购、试点vs全量 rollout；标注各场景战略意义。
+
+6. 战略结论（Strategic Implications）
+- 3–5 条有力度的判断句：阶段、增长来源“不是X而是Y”、哪些资产尚未转译为增长杠杆；每条判断要解释逻辑来源。
+
+7. 增长举措与执行路线图（Strategic Initiatives & Execution Roadmap）
+7.1 3–5 条核心增长策略：适用渠道/客群/场景；动作逻辑；预期影响。
+7.2 渠道分工下的产品/内容架构：不同渠道按动机分层设计；给出清晰结构建议。
+7.3 量化 KPI 与监测节奏：给出可量化目标 + 监测周期 + 预警信号。
+7.4 预期整体影响：3–6个月、6–12个月在收入/盈利/风险分散/品牌资产放大上的影响。
+
+输出风格与格式要求
+- 报告必须分章节、分小节，使用清晰标题。
+- 尽量使用表格展示对比（竞品、渠道角色、价格带 vs 成交表现）。
+- 语言：简洁、有判断力，避免空洞形容词；多用“结构/逻辑/角色/分层/杠杆/解释空间”等概念。
+- 每条建议尽量落到：谁来做、在哪个渠道/场景做、做什么动作、期望看到哪些数据变化。
+""".strip()
+
+def build_quick_prompt(place_details: Dict[str, Any],
+                       acs_data: Optional[Dict[str, Any]],
+                       tract_info: Optional[Dict[str, Any]],
+                       extra_context: str,
+                       report_date: str,
+                       lang: str) -> str:
+    blob = {
+        "report_date": report_date,
+        "business": {
+            "name": place_details.get("name", ""),
+            "address": place_details.get("formatted_address", ""),
+            "types": place_details.get("types", []),
+            "rating": place_details.get("rating", None),
+            "user_ratings_total": place_details.get("user_ratings_total", None),
+            "phone": place_details.get("formatted_phone_number", ""),
+            "website": place_details.get("website", ""),
+            "google_url": place_details.get("url", ""),
+            "opening_hours": place_details.get("opening_hours", {}),
+            "reviews_sample": (place_details.get("reviews", []) or [])[:6],
+            "geo": (place_details.get("geometry", {}) or {}).get("location", {}),
+        },
+        "trade_area": {
+            "tract_info": tract_info,
+            "acs": acs_data,
+            "assumption_note": "优先使用 acs.radius_profile（按半径汇总：Block Group 近似）；tract 仅作兜底/行政区标识。"
+        },
+        "extra_business_context": extra_context.strip(),
+        "current_date": dt.datetime.now().strftime("%Y-%m-%d"),
+    }
+
+    if lang == "English":
+        lang_rule = "Output language MUST be English."
+    else:
+        lang_rule = "输出语言必须是中文（简体），除非专有名词需要英文。"
+
+    return f"""
+{MULTI_SYSTEM_STYLE}
+
+{lang_rule}
+
+Hard requirements:
+1) Do NOT output Markdown.
+2) Headings must be numbered like "0. ...", "1. ...", "1.1 ...".
+3) Each major chapter starts with 3-5 Key Takeaways.
+4) Every recommendation must include: Action, Reason, Expected Impact, KPI, 2-week Validation method.
+5) Must include explicit section: Data Gaps & How to Collect.
+6) Must include at least 2 plain text tables (not Markdown).
+
+Input JSON:
+{json.dumps(blob, ensure_ascii=False, indent=2)}
+
+Start writing now:
+""".strip()
+
+
+# =========================================================
+# PDF Render (safer)
 # =========================================================
 def draw_footer(c: canvas.Canvas, report_date: str, page_num: int):
     c.setFillColor(colors.HexColor("#7A7A7A"))
@@ -1035,7 +1654,7 @@ def render_pdf(report_text: str, inputs: ReportInputs) -> str:
     register_fonts()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    safe_name = "".join([ch if ch.isalnum() or ch in ("_", "-", " ") else "_" for ch in (inputs.restaurant_en or "Report")]).strip()
+    safe_name = "".join([ch if ch.isalnum() or ch in ("_", "-", " ") else "_" for ch in inputs.restaurant_en]).strip()
     safe_name = safe_name.replace(" ", "_") or "Report"
     filename = f"AuraInsight_{safe_name}_{inputs.report_date.replace('/','-')}.pdf"
     out_path = os.path.join(OUTPUT_DIR, filename)
@@ -1090,7 +1709,7 @@ def render_pdf(report_text: str, inputs: ReportInputs) -> str:
 
     def draw_body(text: str):
         nonlocal y
-        available_w = PAGE_W - left - 0.90 * inch
+        available_w = PAGE_W - left - 0.90 * inch  # 右边留白对称
 
         for raw in text.splitlines():
             if not raw.strip():
@@ -1173,14 +1792,9 @@ with st.sidebar:
     if show_advanced:
         radius_miles = st.slider("商圈半径（miles）", 1.0, 6.0, 4.0, 0.5)
         nearby_radius_m = st.slider("Google Nearby 搜索半径（米）", 300, 3000, 1200, 100)
-        # NEW trade area sampling
-        rings = st.slider("商圈采样环数（越大越准/越慢）", 2, 6, 4, 1)
-        per_ring = st.slider("每环采样点基数（越大越准/越慢）", 10, 30, 18, 1)
     else:
         radius_miles = 4.0
         nearby_radius_m = 1200
-        rings = 4
-        per_ring = 18
 
     st.divider()
     logout_button()
@@ -1195,15 +1809,15 @@ if not google_key:
 if not openai_key:
     st.warning("未检测到 OPENAI_API_KEY，请在 .streamlit/secrets.toml 配置。")
 
-tab_food = st.tabs(["餐饮业态分析报告"])[0]
+tab_food, tab_quick, tab_menu = st.tabs(["餐饮业态分析报告", "多业态快速诊断报告", "菜单智能调整（老板端）"])
 
 
 # =========================================================
-# Tab 1: 餐饮业态分析报告（FINAL）
+# Tab 1: 餐饮业态分析报告
 # =========================================================
 with tab_food:
     st.subheader("Step 1｜输入地址 → 搜索附近餐厅")
-    address_input = st.text_input("输入地址（用于定位并搜索附近餐厅）", value="1970 Lewelling Blvd, San Leandro, CA 94579", key="addr_search_food")
+    address_input = st.text_input("输入地址（用于定位并搜索附近餐厅）", value="2406 19th Ave, San Francisco, CA 94116", key="addr_search_food")
 
     if st.button("搜索附近餐厅", type="primary", disabled=not google_key, key="btn_search_nearby_food"):
         geo = google_geocode(address_input, google_key)
@@ -1247,7 +1861,7 @@ with tab_food:
                     place_details = details
 
     if place_details:
-        st.subheader("Step 2｜上传菜单 + 自动商圈人口统计（真实 trade area 聚合）")
+        st.subheader("Step 2｜上传菜单 + 自动商圈画像（ACS）")
         loc = (place_details.get("geometry", {}) or {}).get("location", {}) or {}
         rest_lat = float(loc.get("lat")) if loc.get("lat") is not None else None
         rest_lng = float(loc.get("lng")) if loc.get("lng") is not None else None
@@ -1271,68 +1885,47 @@ with tab_food:
 
         with st.expander("自动获取商圈人口/收入/年龄/族裔/租住比例（US Census ACS）", expanded=True):
             if rest_lat and rest_lng:
-                cA, cB = st.columns([1, 1])
-                with cA:
-                    if st.button("获取 Trade Area 人口统计（推荐：按半径聚合）", key="food_btn_trade_area"):
-                        with st.spinner("正在计算商圈人口统计（采样 → tract → ACS → 聚合）..."):
-                            trade_area_acs, trade_debug = aggregate_trade_area_acs(
-                                rest_lat, rest_lng,
+                
+                if st.button("获取商圈人口画像（按半径汇总）", key="food_btn_acs"):
+                    # 1) tract（用于兜底与行政区标识）
+                    tract_info = census_tract_from_latlng(rest_lat, rest_lng)
+                    if not tract_info:
+                        st.warning("无法获取 tract 信息（Census geocoder）。")
+                    else:
+                        # 2) tract ACS（作为兜底）
+                        acs_data = acs_5y_profile(tract_info["STATE"], tract_info["COUNTY"], tract_info["TRACT"], year=2023)
+
+                        # 3) 半径汇总：基于 Block Group 真实人口口径（2020 Decennial）+ 当前估计（ACS 5y）
+                        try:
+                            radius_profile = build_radius_trade_area_profile(
+                                lat=rest_lat,
+                                lng=rest_lng,
                                 radius_miles=radius_miles,
-                                year=2023,
-                                rings=rings,
-                                per_ring=per_ring,
-                                request_delay_s=0.0
+                                acs_year=2023
                             )
-                        st.session_state["food_trade_area_acs"] = trade_area_acs
-                        st.session_state["food_trade_area_debug"] = trade_debug
-                        if trade_area_acs:
-                            st.success("Trade Area 聚合完成（比单 tract 更接近真实商圈）。")
+                        except Exception as e:
+                            radius_profile = {"error": str(e)[:200]}
+
+                        if isinstance(acs_data, dict):
+                            acs_data["radius_profile"] = radius_profile  # 写入，供报告使用
                         else:
-                            st.warning("Trade Area 聚合失败：可能 Census 服务暂时不可用或采样点无法匹配。")
+                            acs_data = {"radius_profile": radius_profile}
 
-                with cB:
-                    if st.button("获取中心点 Tract（仅对照）", key="food_btn_tract_only"):
-                        tract_info = census_tract_from_latlng(rest_lat, rest_lng)
-                        acs_data = None
-                        if tract_info:
-                            acs_data = acs_5y_profile(tract_info["STATE"], tract_info["COUNTY"], tract_info["TRACT"], year=2023)
                         st.session_state["food_tract_info"] = tract_info
-                        st.session_state["food_acs_tract"] = acs_data
-                        st.success("中心点 tract 数据已获取（对照用）。")
-
+                        st.session_state["food_acs_data"] = acs_data
+                        st.success("已获取商圈画像（半径汇总 + tract 兜底）。")
             else:
                 st.info("未能从 Google Place Details 获取坐标，无法调用 ACS。")
 
-            trade_area_acs = st.session_state.get("food_trade_area_acs", None)
-            trade_debug = st.session_state.get("food_trade_area_debug", None)
-            if trade_area_acs:
-                st.write({
-                    "ACS Year": trade_area_acs.get("year"),
-                    "Method": trade_area_acs.get("method"),
-                    "Radius (miles)": trade_area_acs.get("radius_miles"),
-                    "Tracts Used": trade_area_acs.get("tracts_used"),
-                    "Population (trade area est.)": int(trade_area_acs.get("pop_total", 0)),
-                    "% Asian": None if trade_area_acs.get("pct_asian") is None else f"{trade_area_acs.get('pct_asian')*100:.1f}%",
-                    "% White": None if trade_area_acs.get("pct_white") is None else f"{trade_area_acs.get('pct_white')*100:.1f}%",
-                    "% Hispanic": None if trade_area_acs.get("pct_hispanic") is None else f"{trade_area_acs.get('pct_hispanic')*100:.1f}%",
-                    "% Black": None if trade_area_acs.get("pct_black") is None else f"{trade_area_acs.get('pct_black')*100:.1f}%",
-                    "% Renter": None if trade_area_acs.get("pct_renter") is None else f"{trade_area_acs.get('pct_renter')*100:.1f}%",
-                    "Median Age (wavg approx)": None if trade_area_acs.get("median_age_wavg") is None else round(trade_area_acs.get("median_age_wavg"), 1),
-                    "Median HH Income (wavg approx)": None if trade_area_acs.get("median_income_wavg") is None else f"${int(trade_area_acs.get('median_income_wavg')):,}",
-                    "Note": "population/race/owner-renter 为 tract 汇总；中位数为加权近似。"
-                })
-                with st.expander("Trade Area 计算细节（debug）", expanded=False):
-                    st.json(trade_debug)
-
             tract_info = st.session_state.get("food_tract_info", None)
-            acs_tract = st.session_state.get("food_acs_tract", None)
-            if acs_tract:
-                st.caption("中心点 tract（仅对照）")
+            acs_data = st.session_state.get("food_acs_data", None)
+            if acs_data:
                 st.write({
-                    "Tract Geography": acs_tract.get("name"),
-                    "Population (tract)": None if acs_tract.get("pop_total") is None else int(acs_tract.get("pop_total")),
-                    "% Asian (proxy)": None if acs_tract.get("pct_asian") is None else f"{acs_tract.get('pct_asian')*100:.1f}%",
-                    "% Renter (proxy)": None if acs_tract.get("pct_renter") is None else f"{acs_tract.get('pct_renter')*100:.1f}%",
+                    "ACS Year (tract fallback)": acs_data.get("year"),
+                    "Geography (tract fallback)": acs_data.get("name"),
+                    "Population (tract fallback)": None if acs_data.get("pop_total") is None else int(acs_data.get("pop_total")),
+                    "Radius Profile (preferred)": (acs_data.get("radius_profile") or {}),
+                    "Note": "优先使用 Radius Profile：按半径汇总（Block Group 近似）的人口口径；tract 仅作为兜底与行政区标识。"
                 })
 
         with st.expander("上传订单报表（CSV，可选：用于时段/客单/热销/KPI）", expanded=False):
@@ -1343,13 +1936,11 @@ with tab_food:
         if "orders_meta" not in locals():
             orders_meta = {"files": [], "note": "No uploads"}
 
-        st.subheader("Step 3｜生成报告内容（实时看到 AI 输出流）")
-        st.caption("你会看到 AI 正在生成的内容片段（实时流式输出）。这不是“内部思考链”，但能让你看到生成进度与细节。")
-
-        if st.button("生成报告内容（Streaming）", type="primary", disabled=not openai_key, key="food_btn_gen_report_stream"):
+        st.subheader("Step 3｜生成报告内容（先预览可编辑，再生成 PDF）")
+        show_live = st.checkbox("显示 AI 生成过程（流式输出）", value=True, key="food_show_live")
+        if st.button("生成报告内容", type="primary", disabled=not openai_key, key="food_btn_gen_report"):
             progress = st.progress(0)
             status = st.empty()
-            live_box = st.empty()
 
             def step(pct: int, msg: str):
                 progress.progress(pct)
@@ -1360,15 +1951,13 @@ with tab_food:
             step(5, "解析门店菜单…")
             own_menu_meta = extract_menu_with_openai(own_menu_files or [], openai_key, model, label="OWN_MENU")
 
-            step(25, "生成图表…")
+            step(35, "生成图表…")
             own_df = menu_to_df(own_menu_meta)
-            charts = build_charts(own_df)
+            charts = build_charts(own_df, [])
 
-            step(40, "整理商圈人口统计（trade area 聚合优先）…")
-            trade_area_acs = st.session_state.get("food_trade_area_acs", None)
-            trade_debug = st.session_state.get("food_trade_area_debug", None)
+            step(60, "生成报告正文…")
             tract_info = st.session_state.get("food_tract_info", None)
-            acs_tract = st.session_state.get("food_acs_tract", None)
+            acs_data = st.session_state.get("food_acs_data", None)
 
             inputs = ReportInputs(
                 report_date=report_date,
@@ -1380,32 +1969,24 @@ with tab_food:
                 orders_meta=orders_meta,
                 competitors=[],
                 extra_business_context=extra_context.strip(),
+                acs=acs_data,
                 tract_info=tract_info,
-                acs_tract=acs_tract,
-                trade_area_acs=trade_area_acs,
-                trade_area_debug=trade_debug,
                 restaurant_google=place_details,
                 charts=charts,
             )
 
-            step(55, "构建报告提示词…")
             prompt = build_prompt(inputs, report_lang)
+            step(65, "调用模型生成报告（流式输出）…" if show_live else "调用模型生成报告…")
+            live_placeholder = st.empty() if show_live else None
+            log_placeholder = st.empty()
+            if show_live:
+                report_text = openai_text_live(prompt, api_key=openai_key, model=model, ui_placeholder=live_placeholder, ui_log_placeholder=log_placeholder, temperature=0.25)
+            else:
+                report_text = openai_text(prompt, openai_key, model=model, temperature=0.25)
+            report_text = sanitize_text(report_text)
 
-            step(65, "调用 AI 生成报告（实时输出中）…")
-            partial = ""
-            try:
-                for delta in openai_text_stream(prompt, openai_key, model=model, temperature=0.25):
-                    partial += delta
-                    # 只展示末尾一部分，避免 UI 卡顿
-                    show_tail = sanitize_text(partial[-12000:])
-                    live_box.text_area("AI 实时输出（滚动更新）", value=show_tail, height=420)
-                report_text = sanitize_text(partial)
-            except Exception as e:
-                st.error(f"Streaming 失败：{str(e)[:300]}")
-                st.stop()
-
-            step(85, "扩写补全（确保更细 & 可执行）…")
-            report_text = ensure_long_enough(report_text, openai_key, model=model, lang=report_lang, min_chars=14000)
+            step(80, "扩写补全（确保足够细）…")
+            report_text = ensure_long_enough(report_text, openai_key, model=model, lang=report_lang, min_chars=12000)
 
             st.session_state["food_report_text"] = report_text
             st.session_state["food_report_inputs"] = inputs
@@ -1421,6 +2002,7 @@ with tab_food:
             edited = st.text_area("报告正文", value=report_text, height=520, key="food_report_editor")
             st.session_state["food_report_text"] = sanitize_text(edited)
 
+            
             st.subheader("图表预览（将自动附在 PDF 后面）")
             if report_inputs.charts:
                 cols = st.columns(2)
@@ -1428,7 +2010,16 @@ with tab_food:
                 for k, v in report_inputs.charts.items():
                     with cols[idx % 2]:
                         st.caption(k)
-                        safe_st_image(v)
+                        if isinstance(v, (bytes, bytearray)) and len(v) > 50:
+                            try:
+                                from PIL import Image
+                                import io as _io
+                                img = Image.open(_io.BytesIO(v))
+                                st.image(img, use_container_width=True)
+                            except Exception as _e:
+                                st.warning(f"{k} 图表预览失败（已跳过）：{str(_e)[:120]}")
+                        else:
+                            st.warning(f"{k} 图表数据缺失，已跳过。")
                     idx += 1
             else:
                 st.info("暂无图表（通常是菜单价格识别不足导致）。")
@@ -1439,7 +2030,476 @@ with tab_food:
                     pdf_path = render_pdf(st.session_state["food_report_text"], report_inputs)
                 st.success("PDF 生成完成。")
                 with open(pdf_path, "rb") as f:
-                    st.download_button("下载 PDF", f, file_name=os.path.basename(pdf_path), mime="application/pdf")
+                    pdf_bytes = f.read()
+                st.download_button("下载 PDF", pdf_bytes, file_name=os.path.basename(pdf_path), mime="application/pdf")
                 st.caption(f"输出路径：{pdf_path}")
         else:
             st.info("先生成报告内容后，这里会出现预览与PDF下载。")
+
+
+# =========================================================
+# Tab 2: 多业态快速诊断报告
+# =========================================================
+with tab_quick:
+    st.subheader("Step 1｜输入地址 → 搜索附近商家（可用于餐厅/头疗/美容/零售/健身等）")
+    address_input = st.text_input("输入地址（用于定位并搜索附近商家）", value="San Bruno, CA", key="addr_search_quick")
+
+    place_type = st.selectbox(
+        "选择要搜索的商家类型（Google Places type）",
+        ["establishment", "restaurant", "beauty_salon", "spa", "hair_care", "gym", "store", "cafe", "doctor", "dentist"],
+        index=0,
+        key="quick_place_type"
+    )
+
+    if st.button("搜索附近商家", type="primary", disabled=not google_key, key="btn_search_nearby_quick"):
+        geo = google_geocode(address_input, google_key)
+        if not geo:
+            st.error("无法解析地址，请输入更完整地址（含城市/州）。")
+        else:
+            lat, lng = geo
+            places = google_nearby_places(lat, lng, google_key, radius_m=nearby_radius_m, place_type=place_type)
+            st.session_state["quick_geo"] = (lat, lng)
+            st.session_state["quick_places"] = places
+            st.success(f"已找到 {len(places)} 个附近商家。")
+
+    places = st.session_state.get("quick_places", [])
+    q_place_details = st.session_state.get("quick_place_details", {})
+
+    if places:
+        options, id_map = [], {}
+        for p in places:
+            name = p.get("name", "")
+            addr = p.get("vicinity", "")
+            rating = p.get("rating", "NA")
+            total = p.get("user_ratings_total", "NA")
+            pid = p.get("place_id", "")
+            label = f"{name} | {addr} | ⭐{rating} ({total})"
+            options.append(label)
+            id_map[label] = pid
+
+        selected_label = st.selectbox("选择目标商家（Google Nearby）", options, key="sel_place_quick")
+        selected_place_id = id_map.get(selected_label)
+
+        if st.button("拉取商家详情（Google Place Details）", disabled=not google_key, key="btn_details_quick"):
+            if not selected_place_id:
+                st.error("请先选择一个商家。")
+            else:
+                details = google_place_details(selected_place_id, google_key)
+                if not details:
+                    st.error("拉取详情失败。")
+                else:
+                    st.session_state["quick_place_details"] = details
+                    st.success("已拉取商家详情。")
+                    q_place_details = details
+
+    if q_place_details:
+        st.subheader("Step 2｜自动商圈画像（ACS）+ 补充背景")
+        loc = (q_place_details.get("geometry", {}) or {}).get("location", {}) or {}
+        q_lat = float(loc.get("lat")) if loc.get("lat") is not None else None
+        q_lng = float(loc.get("lng")) if loc.get("lng") is not None else None
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            business_name = st.text_input("业务名称（可手动改）", value=q_place_details.get("name", ""), key="quick_name")
+            business_address = st.text_input("业务地址", value=q_place_details.get("formatted_address", ""), key="quick_addr")
+            st.caption(f"Google：⭐{q_place_details.get('rating','')}（{q_place_details.get('user_ratings_total','')} reviews）")
+        with col2:
+            extra_context = st.text_area("补充业务背景（可选）", value="", height=140, key="quick_ctx")
+
+        with st.expander("自动获取区域画像（US Census ACS）", expanded=True):
+            if q_lat and q_lng:
+                if st.button("获取 ACS 区域画像（自动）", key="quick_btn_acs"):
+                    tract_info = census_tract_from_latlng(q_lat, q_lng)
+                    if not tract_info:
+                        st.warning("无法获取 tract 信息（Census geocoder）。")
+                    else:
+                        acs_data = acs_5y_profile(tract_info["STATE"], tract_info["COUNTY"], tract_info["TRACT"], year=2023)
+                        st.session_state["quick_tract_info"] = tract_info
+                        st.session_state["quick_acs_data"] = acs_data
+                        st.success("已获取 ACS 数据（tract 级别代理）。")
+            else:
+                st.info("未能从 Google Place Details 获取坐标，无法调用 ACS。")
+
+            tract_info = st.session_state.get("quick_tract_info", None)
+            acs_data = st.session_state.get("quick_acs_data", None)
+            if acs_data:
+                st.write({
+                    "ACS Year": acs_data.get("year"),
+                    "Geography": acs_data.get("name"),
+                    "Population (tract)": None if acs_data.get("pop_total") is None else int(acs_data.get("pop_total")),
+                    "Median HH Income": None if acs_data.get("median_income") is None else f"${int(acs_data.get('median_income')):,}",
+                    "Median Age": acs_data.get("median_age"),
+                    "% Asian (proxy)": None if acs_data.get("pct_asian") is None else f"{acs_data.get('pct_asian')*100:.1f}%",
+                    "% Renter (proxy)": None if acs_data.get("pct_renter") is None else f"{acs_data.get('pct_renter')*100:.1f}%",
+                    "Note": "优先使用 acs.radius_profile（按半径汇总：Block Group 近似）；tract 仅作兜底/行政区标识。"
+                })
+
+        st.subheader("Step 3｜生成快速诊断报告内容（先预览可编辑，再生成 PDF）")
+        if st.button("生成报告内容", type="primary", disabled=not openai_key, key="quick_btn_gen"):
+            progress = st.progress(0)
+            status = st.empty()
+
+            def step(pct: int, msg: str):
+                progress.progress(pct)
+                status.info(msg)
+
+            report_date = dt.datetime.now().strftime("%m/%d/%Y")
+            step(25, "整理输入数据…")
+            tract_info = st.session_state.get("quick_tract_info", None)
+            acs_data = st.session_state.get("quick_acs_data", None)
+
+            q_place_details2 = dict(q_place_details)
+            q_place_details2["name"] = business_name.strip()
+            q_place_details2["formatted_address"] = business_address.strip()
+
+            step(60, "AI 生成快速诊断正文…")
+            prompt = build_quick_prompt(
+                place_details=q_place_details2,
+                acs_data=acs_data,
+                tract_info=tract_info,
+                extra_context=extra_context,
+                report_date=report_date,
+                lang=report_lang
+            )
+            text_out = openai_text(prompt, openai_key, model=model, temperature=0.25)
+            text_out = sanitize_text(text_out)
+
+            step(85, "扩写补全（确保足够细）…")
+            text_out = ensure_long_enough(text_out, openai_key, model=model, lang=report_lang, min_chars=9000)
+
+            inputs = ReportInputs(
+                report_date=report_date,
+                restaurant_cn=business_name.strip(),
+                restaurant_en=business_name.strip(),
+                address=business_address.strip(),
+                radius_miles=radius_miles,
+                own_menu_meta={"label": "N/A", "files": [], "extracted": {"note": "N/A", "items": [], "promos": [], "notes": []}},
+                orders_meta={"files": [], "note": "N/A"},
+                competitors=[],
+                extra_business_context=extra_context.strip(),
+                acs=acs_data,
+                tract_info=tract_info,
+                restaurant_google=q_place_details2,
+                charts={},
+            )
+
+            st.session_state["quick_report_text"] = text_out
+            st.session_state["quick_report_inputs"] = inputs
+
+            step(100, "完成：可预览编辑，再生成PDF。")
+            status.success("快速诊断报告已生成。")
+
+        q_text = st.session_state.get("quick_report_text", "")
+        q_inputs: Optional[ReportInputs] = st.session_state.get("quick_report_inputs", None)
+
+        if q_text and q_inputs:
+            st.subheader("报告预览（可编辑）")
+            edited = st.text_area("报告正文", value=q_text, height=520, key="quick_editor")
+            st.session_state["quick_report_text"] = sanitize_text(edited)
+
+            st.subheader("Step 4｜生成 PDF")
+            if st.button("生成 PDF", type="primary", key="quick_btn_pdf"):
+                with st.spinner("正在生成 PDF..."):
+                    pdf_path = render_pdf(st.session_state["quick_report_text"], q_inputs)
+                st.success("PDF 生成完成。")
+                with open(pdf_path, "rb") as f:
+                    pdf_bytes = f.read()
+                st.download_button("下载 PDF", pdf_bytes, file_name=os.path.basename(pdf_path), mime="application/pdf")
+                st.caption(f"输出路径：{pdf_path}")
+        else:
+            st.info("先生成报告内容后，这里会出现预览与PDF下载。")
+
+
+# =========================================================
+# Tab 3: 菜单智能调整（老板端：粘贴/上传/链接 三种方式）
+# =========================================================
+with tab_menu:
+    st.subheader("菜单智能调整（老板端）｜粘贴 / 上传 / 链接 三种方式")
+    st.caption("不需要先上传也能开始；补充菜单后，AI 将进一步优化：名字 / 描述 / 排序 / 套餐，并结合竞对价带做“先调价再组套餐”。")
+
+    if not openai_key:
+        st.warning("未检测到 OPENAI_API_KEY，请在 .streamlit/secrets.toml 配置后使用菜单智能调整。")
+        st.stop()
+
+    st.markdown("### 目标与定价策略")
+    colS1, colS2, colS3 = st.columns([1, 1, 1])
+
+    with colS1:
+        menu_rest_name = st.text_input("门店名称（用于菜单输出）", value="My Restaurant", key="menu_rest_name_v2")
+        menu_rest_addr = st.text_input("门店地址（用于市场对标提示）", value="San Francisco, CA", key="menu_rest_addr_v2")
+        menu_lang = st.selectbox("输出菜单语言", ["中文", "English"], index=0, key="menu_lang_v2")
+
+    with colS2:
+        objective_ui = st.radio(
+            "主目标",
+            ["优先引流品（低毛利高转化）", "优先利润最大化"],
+            index=0,
+            key="objective_ui_v2"
+        )
+        objective_mode = "acquisition" if "引流" in objective_ui else "profit"
+        price_layering = st.checkbox("启用堂食价/外卖价分层（推荐）", value=True, key="price_layering_v2")
+
+    with colS3:
+        commission_choice = st.selectbox("平台抽佣（用于外卖价测算）", ["25%", "30%", "自定义"], index=1, key="commission_choice_v2")
+        if commission_choice == "自定义":
+            commission_rate = st.number_input("自定义抽佣比例（0~0.6）", min_value=0.0, max_value=0.6, value=0.30, step=0.01, key="commission_custom_v2")
+        else:
+            commission_rate = 0.25 if commission_choice == "25%" else 0.30
+
+    st.divider()
+
+    st.markdown("## A. 你的菜单（任选一种方式输入）")
+
+    own_method = st.radio(
+        "选择输入方式",
+        ["方式1：直接粘贴菜单文本（最快）", "方式2：上传菜单 Excel / 图片（推荐）", "方式3：粘贴外卖平台链接（DoorDash / UberEats）"],
+        index=0,
+        key="own_method"
+    )
+
+    own_menu_meta = None
+    own_platform_hint = ""
+
+    if own_method.startswith("方式1"):
+        own_text = st.text_area(
+            "粘贴你的菜单文本（从平台后台/Word/微信/备注复制均可）",
+            height=220,
+            placeholder="示例：\n焗饭\n白汁鸡排焗饭 18.99\n黑椒猪排焗饭 19.99\n饮品\n港式奶茶 5.50\n...",
+            key="own_paste_text"
+        )
+        own_platform_hint = st.text_input("可选：平台线索（DoorDash/UberEats/...）", value="", key="own_paste_platform_hint")
+
+        if st.button("解析我的菜单（粘贴文本）", type="primary", key="btn_parse_own_paste"):
+            with st.spinner("正在解析菜单文本…"):
+                own_menu_meta = extract_menu_from_pasted_text(
+                    menu_text=own_text,
+                    api_key=openai_key,
+                    model=model,
+                    label="OWN_MENU_PASTED",
+                    platform_hint=own_platform_hint
+                )
+            st.session_state["own_menu_meta_v2"] = own_menu_meta
+
+    elif own_method.startswith("方式2"):
+        own_menu_files = st.file_uploader(
+            "上传门店菜单（png/jpg/txt/csv/xlsx，多文件）",
+            type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
+            accept_multiple_files=True,
+            key="own_upload_files_v2"
+        )
+        if st.button("解析我的菜单（上传文件）", type="primary", key="btn_parse_own_upload"):
+            with st.spinner("正在解析上传文件…"):
+                own_menu_meta = extract_menu_with_openai(own_menu_files or [], openai_key, model, label="OWN_MENU_UPLOADED")
+            st.session_state["own_menu_meta_v2"] = own_menu_meta
+
+    else:
+        own_link = st.text_input("粘贴外卖平台链接", value="", key="own_link_v2")
+        if st.button("识别平台并给出导入指引", key="btn_own_link_help"):
+            info = build_link_intake_help(own_link)
+            st.session_state["own_link_info_v2"] = info
+
+        info = st.session_state.get("own_link_info_v2", None)
+        if info:
+            st.info("\n\n".join(info["tips"]))
+            own_platform_hint = info.get("platform", "")
+
+            st.markdown("#### 从链接导入（推荐：复制菜单文本到下面）")
+            own_text2 = st.text_area(
+                "把你从平台复制出来的菜单文本粘贴到这里，然后点击解析",
+                height=200,
+                key="own_link_paste_text"
+            )
+            if st.button("解析我的菜单（链接→粘贴文本）", type="primary", key="btn_parse_own_link_paste"):
+                with st.spinner("正在解析菜单文本…"):
+                    own_menu_meta = extract_menu_from_pasted_text(
+                        menu_text=own_text2,
+                        api_key=openai_key,
+                        model=model,
+                        label="OWN_MENU_FROM_LINK",
+                        platform_hint=own_platform_hint
+                    )
+                st.session_state["own_menu_meta_v2"] = own_menu_meta
+
+    own_menu_meta = st.session_state.get("own_menu_meta_v2", None)
+    if own_menu_meta:
+        with st.expander("已解析：我的菜单（预览）", expanded=False):
+            df_own = menu_to_df(own_menu_meta)
+            st.write(f"解析到菜品数：{0 if df_own is None else int(df_own.shape[0])}")
+            st.dataframe(df_own.head(80), use_container_width=True, height=320)
+            if (own_menu_meta.get("extracted") or {}).get("notes"):
+                st.caption("解析备注：")
+                st.write((own_menu_meta.get("extracted") or {}).get("notes")[:20])
+
+    st.divider()
+
+    st.markdown("## B. 竞对菜单（强烈建议至少 1 家，可选）")
+    st.caption("竞对输入也支持三种方式。你至少给 1 个竞对，市场价带判断会明显更准。")
+
+    comp_enabled = st.checkbox("我有竞对菜单要导入", value=True, key="comp_enabled_v2")
+    comp_menu_metas: List[Dict[str, Any]] = []
+
+    if comp_enabled:
+        comp_method = st.radio(
+            "竞对输入方式",
+            ["方式1：直接粘贴菜单文本", "方式2：上传菜单文件", "方式3：粘贴外卖平台链接"],
+            index=1,
+            key="comp_method_v2"
+        )
+
+        if comp_method.startswith("方式1"):
+            comp_name = st.text_input("竞对名称（可选）", value="Competitor A", key="comp_name_paste")
+            comp_text = st.text_area("粘贴竞对菜单文本", height=200, key="comp_paste_text")
+            comp_platform_hint = st.text_input("可选：平台线索", value="", key="comp_paste_platform_hint")
+            if st.button("解析竞对菜单（粘贴文本）", type="secondary", key="btn_parse_comp_paste"):
+                with st.spinner("正在解析竞对菜单文本…"):
+                    meta = extract_menu_from_pasted_text(
+                        menu_text=comp_text,
+                        api_key=openai_key,
+                        model=model,
+                        label=f"COMP_MENU_PASTED::{comp_name}",
+                        platform_hint=comp_platform_hint
+                    )
+                st.session_state.setdefault("comp_menu_metas_v2", [])
+                st.session_state["comp_menu_metas_v2"].append(meta)
+
+        elif comp_method.startswith("方式2"):
+            comp_name2 = st.text_input("竞对名称（可选）", value="Competitor A", key="comp_name_upload")
+            comp_files = st.file_uploader(
+                "上传竞对菜单（png/jpg/txt/csv/xlsx，多文件）",
+                type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
+                accept_multiple_files=True,
+                key="comp_upload_files_v2"
+            )
+            if st.button("解析竞对菜单（上传文件）", type="secondary", key="btn_parse_comp_upload"):
+                with st.spinner("正在解析竞对菜单文件…"):
+                    meta = extract_menu_with_openai(comp_files or [], openai_key, model, label=f"COMP_MENU_UPLOADED::{comp_name2}")
+                st.session_state.setdefault("comp_menu_metas_v2", [])
+                st.session_state["comp_menu_metas_v2"].append(meta)
+
+        else:
+            comp_link = st.text_input("竞对外卖平台链接", value="", key="comp_link_v2")
+            if st.button("识别竞对平台并给出导入指引", key="btn_comp_link_help"):
+                info = build_link_intake_help(comp_link)
+                st.session_state["comp_link_info_v2"] = info
+
+            info = st.session_state.get("comp_link_info_v2", None)
+            if info:
+                st.info("\n\n".join(info["tips"]))
+                comp_platform_hint = info.get("platform", "")
+
+                comp_name3 = st.text_input("竞对名称（可选）", value="Competitor A", key="comp_name_link")
+                comp_text2 = st.text_area("把你从平台复制出来的竞对菜单文本粘贴到这里", height=200, key="comp_link_paste_text")
+                if st.button("解析竞对菜单（链接→粘贴文本）", type="secondary", key="btn_parse_comp_link_paste"):
+                    with st.spinner("正在解析竞对菜单文本…"):
+                        meta = extract_menu_from_pasted_text(
+                            menu_text=comp_text2,
+                            api_key=openai_key,
+                            model=model,
+                            label=f"COMP_MENU_FROM_LINK::{comp_name3}",
+                            platform_hint=comp_platform_hint
+                        )
+                    st.session_state.setdefault("comp_menu_metas_v2", [])
+                    st.session_state["comp_menu_metas_v2"].append(meta)
+
+        comp_menu_metas = st.session_state.get("comp_menu_metas_v2", [])
+        if comp_menu_metas:
+            with st.expander(f"已导入竞对数量：{len(comp_menu_metas)}（预览）", expanded=False):
+                for i, meta in enumerate(comp_menu_metas[-5:], start=1):
+                    st.markdown(f"**#{i} {meta.get('label','')}**")
+                    dfc = menu_to_df(meta)
+                    st.dataframe(dfc.head(30), use_container_width=True, height=220)
+
+        if st.button("清空所有竞对导入", key="btn_clear_comp_v2"):
+            st.session_state["comp_menu_metas_v2"] = []
+            st.rerun()
+
+    st.divider()
+
+    st.markdown("## C. 生成：名字 / 描述 / 排序 / 套餐（先调价→再组套餐）")
+    st.caption("你会得到可直接上架的菜单结构（含堂食/外卖价分层与抽佣净到手估算），并可下载 CSV/JSON。")
+
+    run_disabled = (own_menu_meta is None) or (menu_to_df(own_menu_meta).empty)
+
+    if st.button("生成智能菜单结构（升级版）", type="primary", disabled=run_disabled, key="btn_opt_menu_v2"):
+        progress = st.progress(0)
+        status = st.empty()
+
+        def step(pct: int, msg: str):
+            progress.progress(pct)
+            status.info(msg)
+
+        step(10, "整理菜单数据…")
+        own_df = menu_to_df(own_menu_meta)
+        comp_dfs = []
+        comp_metas_final = []
+        for meta in (comp_menu_metas or []):
+            dfc = menu_to_df(meta)
+            if dfc is not None and not dfc.empty:
+                comp_dfs.append(dfc)
+                comp_metas_final.append(meta)
+
+        step(35, "计算同行价带与偏高判断…")
+        market_summary = summarize_market_prices(own_df, comp_dfs)
+
+        step(70, "AI：先调价→再组套餐→排序→分层定价→抽佣净到手测算…")
+        try:
+            optimized_df = generate_optimized_menu_df(
+                api_key=openai_key,
+                model=model,
+                restaurant_name=menu_rest_name,
+                address=menu_rest_addr,
+                own_menu_meta=own_menu_meta,
+                competitor_menu_metas=comp_metas_final if comp_metas_final else [],
+                market_summary=market_summary,
+                lang=menu_lang,
+                objective_mode=objective_mode,
+                commission_rate=float(commission_rate),
+                price_layering=bool(price_layering),
+            )
+        except Exception as e:
+            st.error(f"生成失败：{str(e)[:300]}")
+            st.stop()
+
+        st.session_state["optimized_menu_df_v2"] = optimized_df
+        st.session_state["optimized_market_summary_v2"] = market_summary
+        st.session_state["optimized_settings_v2"] = {
+            "objective_mode": objective_mode,
+            "commission_rate": float(commission_rate),
+            "price_layering": bool(price_layering),
+            "lang": menu_lang,
+            "own_input_method": own_method,
+            "competitors_count": len(comp_metas_final),
+        }
+
+        step(100, "完成。")
+        status.success("已生成智能菜单结构（升级版）。")
+
+    optimized_df = st.session_state.get("optimized_menu_df_v2", None)
+    if isinstance(optimized_df, pd.DataFrame) and not optimized_df.empty:
+        st.subheader("智能菜单预览（可直接下载）")
+        st.dataframe(optimized_df, use_container_width=True, height=520)
+
+        with st.expander("本次策略参数（用于复盘/对齐）", expanded=False):
+            st.json(st.session_state.get("optimized_settings_v2", {}))
+
+        with st.expander("同行价带摘要（用于解释为什么要调价/怎么锚点）", expanded=False):
+            st.json(st.session_state.get("optimized_market_summary_v2", {}))
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "下载菜单结构 CSV",
+                data=df_to_csv_bytes(optimized_df),
+                file_name="optimized_menu.csv",
+                mime="text/csv"
+            )
+        with c2:
+            st.download_button(
+                "下载菜单结构 JSON",
+                data=df_to_json_bytes(optimized_df),
+                file_name="optimized_menu.json",
+                mime="application/json"
+            )
+    else:
+        st.info("请先导入【你的菜单】（任一方式），然后点击生成。")
+
