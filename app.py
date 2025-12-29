@@ -1,3 +1,8 @@
+# app.py
+# AuraInsight 报告生成器（Trade Area & Growth Diagnostic）
+# NOTE: This is a single-file Streamlit app assembled from the code you provided,
+# with Tab 3 replaced by the upgraded "粘贴/上传/链接" 菜单智能调整老板端体验。
+
 import os
 import re
 import io
@@ -208,16 +213,6 @@ def sanitize_text(text: str) -> str:
     text = re.sub(r'^\s{0,3}#{1,6}\s*', '', text, flags=re.M)
     text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
     return text.strip()
-
-def wrap_lines_by_chars(text: str, max_chars: int) -> List[str]:
-    lines: List[str] = []
-    for para in text.splitlines():
-        para = para.rstrip()
-        if not para.strip():
-            lines.append("")
-            continue
-        lines.extend(textwrap.wrap(para, width=max_chars, break_long_words=False, replace_whitespace=False))
-    return lines
 
 def wrap_lines_by_pdf_width(text: str, font_name: str, font_size: int, max_width: float) -> List[str]:
     """
@@ -452,7 +447,7 @@ def acs_5y_profile(state: str, county: str, tract: str, year: int = 2023) -> Opt
 
 
 # =========================================================
-# OpenAI Responses API
+# OpenAI Responses API (minimal wrapper)
 # =========================================================
 def openai_responses(api_key: str, payload: Dict[str, Any], timeout: int = 240) -> Dict[str, Any]:
     url = "https://api.openai.com/v1/responses"
@@ -619,6 +614,94 @@ def extract_menu_with_openai(files: List[Any], api_key: str, model: str, label: 
 
 
 # =========================================================
+# NEW: Pasted text intake + link intake helper
+# =========================================================
+def extract_menu_from_pasted_text(menu_text: str, api_key: str, model: str, label: str, platform_hint: str = "") -> Dict[str, Any]:
+    """
+    将用户粘贴的菜单文本，直接用 OpenAI 转成和 extract_menu_with_openai 一致的结构：
+    {"label":..., "files":..., "extracted":{"items":[...], "promos":[...], "notes":[...]}}
+    """
+    menu_text = (menu_text or "").strip()
+    if not menu_text:
+        return {"label": label, "files": [], "extracted": {"note": "empty text", "items": [], "promos": [], "notes": ["empty menu_text"]}}
+
+    prompt = (
+        "你是餐厅外卖菜单解析器。下面是用户粘贴的菜单文本（可能混合中英文、带价格、带分类）。\n"
+        "请提取：\n"
+        "1) 菜品名称 name（尽量保留中英文原名）\n"
+        "2) 价格 price（保留原货币符号或数值）\n"
+        "3) 分类 category（如果没有就填空字符串）\n"
+        "4) 备注 notes（如：辣度/大小份/套餐/加价项/招牌等）\n"
+        "5) 促销 promos（如买一送一/折扣/满减等）\n\n"
+        f"平台线索(platform_hint) = {platform_hint}\n"
+        "只输出 JSON，不要输出任何额外文字。\n"
+        "JSON结构："
+        "{\"items\":[{\"name\":\"\",\"price\":\"\",\"category\":\"\",\"notes\":\"\"}],"
+        "\"promos\":[\"\"],\"platform_hints\":[\"\"],\"quality_flags\":[\"\"]}\n\n"
+        "菜单原文开始：\n"
+        f"{menu_text[:65000]}\n"
+        "菜单原文结束。"
+    )
+
+    notes = []
+    try:
+        text_out = openai_text(prompt, api_key, model=model, temperature=0.2)
+        m = re.search(r"\{.*\}", text_out, flags=re.S)
+        if not m:
+            notes.append("粘贴文本解析：AI 输出无法解析为 JSON。")
+            return {"label": label, "files": [], "extracted": {"note": "parse_failed", "items": [], "promos": [], "notes": notes}}
+
+        obj = json.loads(m.group(0))
+        items = obj.get("items", []) or []
+        promos = obj.get("promos", []) or []
+        items = items[:2000]
+        promos = promos[:200]
+
+        return {
+            "label": label,
+            "files": [{"name": "pasted_menu.txt", "type": "text/plain"}],
+            "extracted": {
+                "items": items,
+                "promos": promos,
+                "notes": notes + (obj.get("quality_flags", []) or []),
+            }
+        }
+    except Exception as e:
+        notes.append(f"粘贴文本解析失败: {str(e)[:200]}")
+        return {"label": label, "files": [], "extracted": {"note": "exception", "items": [], "promos": [], "notes": notes}}
+
+
+def build_link_intake_help(link: str) -> Dict[str, Any]:
+    """
+    链接入口不直接爬虫（稳定&合规），用于：
+    - 识别平台
+    - 指引用户如何从平台复制菜单文本/导出
+    """
+    link = (link or "").strip()
+    s = link.lower()
+    platform = "Unknown"
+    if "doordash" in s:
+        platform = "DoorDash"
+    elif "ubereats" in s or "ubereat" in s:
+        platform = "UberEats"
+    elif "grubhub" in s:
+        platform = "Grubhub"
+    elif "fantuan" in s:
+        platform = "Fantuan"
+    elif "hungrypanda" in s or "panda" in s:
+        platform = "Panda"
+
+    tips = [
+        f"识别平台：{platform}",
+        "建议导入（任选其一）：",
+        "A) 打开链接 → 在平台后台/菜单页把菜品列表复制成文本 → 粘贴到【方式1：粘贴菜单文本】",
+        "B) 从平台后台导出菜单（CSV/Excel）→ 用【方式2：上传 Excel】上传",
+        "C) 如果你能拿到截图（菜单页截图）→ 直接上传图片（png/jpg）也可识别"
+    ]
+    return {"platform": platform, "tips": tips}
+
+
+# =========================================================
 # Menu Stats + Charts
 # =========================================================
 def _to_price(x: Any) -> Optional[float]:
@@ -703,7 +786,7 @@ def build_charts(own_df: pd.DataFrame, comps: List[Tuple[str, pd.DataFrame]]) ->
 
 
 # =========================================================
-# Menu Optimizer (anchor + market + bundles + commission + price layers)
+# Menu Optimizer
 # =========================================================
 def summarize_market_prices(own_df: pd.DataFrame, comp_dfs: List[pd.DataFrame]) -> Dict[str, Any]:
     all_comp = pd.concat([df for df in comp_dfs if df is not None and not df.empty], ignore_index=True) if comp_dfs else pd.DataFrame()
@@ -1339,11 +1422,11 @@ if not google_key:
 if not openai_key:
     st.warning("未检测到 OPENAI_API_KEY，请在 .streamlit/secrets.toml 配置。")
 
-tab_food, tab_quick, tab_menu = st.tabs(["餐饮业态分析报告", "多业态快速诊断报告", "菜单智能调整"])
+tab_food, tab_quick, tab_menu = st.tabs(["餐饮业态分析报告", "多业态快速诊断报告", "菜单智能调整（老板端）"])
 
 
 # =========================================================
-# Tab 1: 餐饮业态分析报告（原：商圈分析报告）
+# Tab 1: 餐饮业态分析报告
 # =========================================================
 with tab_food:
     st.subheader("Step 1｜输入地址 → 搜索附近餐厅")
@@ -1646,7 +1729,6 @@ with tab_quick:
             tract_info = st.session_state.get("quick_tract_info", None)
             acs_data = st.session_state.get("quick_acs_data", None)
 
-            # 强制覆盖 name/address（用户可手动改）
             q_place_details2 = dict(q_place_details)
             q_place_details2["name"] = business_name.strip()
             q_place_details2["formatted_address"] = business_address.strip()
@@ -1666,7 +1748,6 @@ with tab_quick:
             step(85, "扩写补全（确保足够细）…")
             text_out = ensure_long_enough(text_out, openai_key, model=model, lang=report_lang, min_chars=9000)
 
-            # 复用 ReportInputs 作为 PDF 封面/页脚信息
             inputs = ReportInputs(
                 report_date=report_date,
                 restaurant_cn=business_name.strip(),
@@ -1710,60 +1791,216 @@ with tab_quick:
 
 
 # =========================================================
-# Tab 3: Menu Optimizer (保持原功能)
+# Tab 3: 菜单智能调整（老板端：粘贴/上传/链接 三种方式）
 # =========================================================
 with tab_menu:
-    st.subheader("菜单智能调整（价格锚点 + 心理定价 + 同行对标 + 套餐重构 + 抽佣测算）")
-    st.caption("流程：识别菜单 → 引入竞对菜单 → 判断价带偏差 → 先调价 → 再组套餐 → 输出可直接上架的菜单结构（含堂食/外卖分层与抽佣净到手估算）。")
+    st.subheader("菜单智能调整（老板端）｜粘贴 / 上传 / 链接 三种方式")
+    st.caption("不需要先上传也能开始；补充菜单后，AI 将进一步优化：名字 / 描述 / 排序 / 套餐，并结合竞对价带做“先调价再组套餐”。")
 
-    colA, colB = st.columns([1, 1])
-    with colA:
-        menu_rest_name = st.text_input("门店名称（用于菜单输出）", value="My Restaurant", key="menu_rest_name")
-        menu_rest_addr = st.text_input("门店地址（用于市场对标提示）", value="San Francisco, CA", key="menu_rest_addr")
-        menu_lang = st.selectbox("输出菜单语言", ["中文", "English"], index=0, key="menu_lang")
+    if not openai_key:
+        st.warning("未检测到 OPENAI_API_KEY，请在 .streamlit/secrets.toml 配置后使用菜单智能调整。")
+        st.stop()
 
-        st.markdown("### 策略目标（新增）")
+    st.markdown("### 目标与定价策略")
+    colS1, colS2, colS3 = st.columns([1, 1, 1])
+
+    with colS1:
+        menu_rest_name = st.text_input("门店名称（用于菜单输出）", value="My Restaurant", key="menu_rest_name_v2")
+        menu_rest_addr = st.text_input("门店地址（用于市场对标提示）", value="San Francisco, CA", key="menu_rest_addr_v2")
+        menu_lang = st.selectbox("输出菜单语言", ["中文", "English"], index=0, key="menu_lang_v2")
+
+    with colS2:
         objective_ui = st.radio(
-            "选择一个主目标",
+            "主目标",
             ["优先引流品（低毛利高转化）", "优先利润最大化"],
             index=0,
-            key="objective_ui"
+            key="objective_ui_v2"
         )
         objective_mode = "acquisition" if "引流" in objective_ui else "profit"
+        price_layering = st.checkbox("启用堂食价/外卖价分层（推荐）", value=True, key="price_layering_v2")
 
-        st.markdown("### 价格分层（新增）")
-        price_layering = st.checkbox(
-            "启用堂食价/外卖价分层（推荐）",
-            value=True,
-            key="price_layering"
-        )
-
-        st.markdown("### 平台抽佣（新增）")
-        commission_choice = st.selectbox("平台抽佣（用于外卖价测算）", ["25%", "30%", "自定义"], index=1, key="commission_choice")
+    with colS3:
+        commission_choice = st.selectbox("平台抽佣（用于外卖价测算）", ["25%", "30%", "自定义"], index=1, key="commission_choice_v2")
         if commission_choice == "自定义":
-            commission_rate = st.number_input("自定义抽佣比例（0~0.6）", min_value=0.0, max_value=0.6, value=0.30, step=0.01, key="commission_custom")
+            commission_rate = st.number_input("自定义抽佣比例（0~0.6）", min_value=0.0, max_value=0.6, value=0.30, step=0.01, key="commission_custom_v2")
         else:
             commission_rate = 0.25 if commission_choice == "25%" else 0.30
 
-        st.caption("提示：如果你想更贴近现实，可在外卖价里把 packaging / delivery fee / promo cost 作为 notes 提示，后续可扩展为成本模型。")
+    st.divider()
 
-    with colB:
-        own_menu_files2 = st.file_uploader(
+    st.markdown("## A. 你的菜单（任选一种方式输入）")
+
+    own_method = st.radio(
+        "选择输入方式",
+        ["方式1：直接粘贴菜单文本（最快）", "方式2：上传菜单 Excel / 图片（推荐）", "方式3：粘贴外卖平台链接（DoorDash / UberEats）"],
+        index=0,
+        key="own_method"
+    )
+
+    own_menu_meta = None
+    own_platform_hint = ""
+
+    if own_method.startswith("方式1"):
+        own_text = st.text_area(
+            "粘贴你的菜单文本（从平台后台/Word/微信/备注复制均可）",
+            height=220,
+            placeholder="示例：\n焗饭\n白汁鸡排焗饭 18.99\n黑椒猪排焗饭 19.99\n饮品\n港式奶茶 5.50\n...",
+            key="own_paste_text"
+        )
+        own_platform_hint = st.text_input("可选：平台线索（DoorDash/UberEats/...）", value="", key="own_paste_platform_hint")
+
+        if st.button("解析我的菜单（粘贴文本）", type="primary", key="btn_parse_own_paste"):
+            with st.spinner("正在解析菜单文本…"):
+                own_menu_meta = extract_menu_from_pasted_text(
+                    menu_text=own_text,
+                    api_key=openai_key,
+                    model=model,
+                    label="OWN_MENU_PASTED",
+                    platform_hint=own_platform_hint
+                )
+            st.session_state["own_menu_meta_v2"] = own_menu_meta
+
+    elif own_method.startswith("方式2"):
+        own_menu_files = st.file_uploader(
             "上传门店菜单（png/jpg/txt/csv/xlsx，多文件）",
             type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
             accept_multiple_files=True,
-            key="own_menu_files_optimizer"
+            key="own_upload_files_v2"
         )
-        st.markdown("**竞对菜单上传（必备）**")
-        comp_menu_files2 = st.file_uploader(
-            "上传竞对菜单（可多家多文件）",
-            type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
-            accept_multiple_files=True,
-            key="comp_menu_files_optimizer"
-        )
-        st.caption("建议：至少 1-2 家竞对菜单；如果没有竞对数据，AI 会提示“数据不足”，并采取更保守的价带策略。")
+        if st.button("解析我的菜单（上传文件）", type="primary", key="btn_parse_own_upload"):
+            with st.spinner("正在解析上传文件…"):
+                own_menu_meta = extract_menu_with_openai(own_menu_files or [], openai_key, model, label="OWN_MENU_UPLOADED")
+            st.session_state["own_menu_meta_v2"] = own_menu_meta
 
-    if st.button("生成智能菜单结构", type="primary", disabled=not openai_key, key="btn_opt_menu"):
+    else:
+        own_link = st.text_input("粘贴外卖平台链接", value="", key="own_link_v2")
+        if st.button("识别平台并给出导入指引", key="btn_own_link_help"):
+            info = build_link_intake_help(own_link)
+            st.session_state["own_link_info_v2"] = info
+
+        info = st.session_state.get("own_link_info_v2", None)
+        if info:
+            st.info("\n\n".join(info["tips"]))
+            own_platform_hint = info.get("platform", "")
+
+            st.markdown("#### 从链接导入（推荐：复制菜单文本到下面）")
+            own_text2 = st.text_area(
+                "把你从平台复制出来的菜单文本粘贴到这里，然后点击解析",
+                height=200,
+                key="own_link_paste_text"
+            )
+            if st.button("解析我的菜单（链接→粘贴文本）", type="primary", key="btn_parse_own_link_paste"):
+                with st.spinner("正在解析菜单文本…"):
+                    own_menu_meta = extract_menu_from_pasted_text(
+                        menu_text=own_text2,
+                        api_key=openai_key,
+                        model=model,
+                        label="OWN_MENU_FROM_LINK",
+                        platform_hint=own_platform_hint
+                    )
+                st.session_state["own_menu_meta_v2"] = own_menu_meta
+
+    own_menu_meta = st.session_state.get("own_menu_meta_v2", None)
+    if own_menu_meta:
+        with st.expander("已解析：我的菜单（预览）", expanded=False):
+            df_own = menu_to_df(own_menu_meta)
+            st.write(f"解析到菜品数：{0 if df_own is None else int(df_own.shape[0])}")
+            st.dataframe(df_own.head(80), use_container_width=True, height=320)
+            if (own_menu_meta.get("extracted") or {}).get("notes"):
+                st.caption("解析备注：")
+                st.write((own_menu_meta.get("extracted") or {}).get("notes")[:20])
+
+    st.divider()
+
+    st.markdown("## B. 竞对菜单（强烈建议至少 1 家，可选）")
+    st.caption("竞对输入也支持三种方式。你至少给 1 个竞对，市场价带判断会明显更准。")
+
+    comp_enabled = st.checkbox("我有竞对菜单要导入", value=True, key="comp_enabled_v2")
+    comp_menu_metas: List[Dict[str, Any]] = []
+
+    if comp_enabled:
+        comp_method = st.radio(
+            "竞对输入方式",
+            ["方式1：直接粘贴菜单文本", "方式2：上传菜单文件", "方式3：粘贴外卖平台链接"],
+            index=1,
+            key="comp_method_v2"
+        )
+
+        if comp_method.startswith("方式1"):
+            comp_name = st.text_input("竞对名称（可选）", value="Competitor A", key="comp_name_paste")
+            comp_text = st.text_area("粘贴竞对菜单文本", height=200, key="comp_paste_text")
+            comp_platform_hint = st.text_input("可选：平台线索", value="", key="comp_paste_platform_hint")
+            if st.button("解析竞对菜单（粘贴文本）", type="secondary", key="btn_parse_comp_paste"):
+                with st.spinner("正在解析竞对菜单文本…"):
+                    meta = extract_menu_from_pasted_text(
+                        menu_text=comp_text,
+                        api_key=openai_key,
+                        model=model,
+                        label=f"COMP_MENU_PASTED::{comp_name}",
+                        platform_hint=comp_platform_hint
+                    )
+                st.session_state.setdefault("comp_menu_metas_v2", [])
+                st.session_state["comp_menu_metas_v2"].append(meta)
+
+        elif comp_method.startswith("方式2"):
+            comp_name2 = st.text_input("竞对名称（可选）", value="Competitor A", key="comp_name_upload")
+            comp_files = st.file_uploader(
+                "上传竞对菜单（png/jpg/txt/csv/xlsx，多文件）",
+                type=["png", "jpg", "jpeg", "webp", "txt", "csv", "xlsx", "xls"],
+                accept_multiple_files=True,
+                key="comp_upload_files_v2"
+            )
+            if st.button("解析竞对菜单（上传文件）", type="secondary", key="btn_parse_comp_upload"):
+                with st.spinner("正在解析竞对菜单文件…"):
+                    meta = extract_menu_with_openai(comp_files or [], openai_key, model, label=f"COMP_MENU_UPLOADED::{comp_name2}")
+                st.session_state.setdefault("comp_menu_metas_v2", [])
+                st.session_state["comp_menu_metas_v2"].append(meta)
+
+        else:
+            comp_link = st.text_input("竞对外卖平台链接", value="", key="comp_link_v2")
+            if st.button("识别竞对平台并给出导入指引", key="btn_comp_link_help"):
+                info = build_link_intake_help(comp_link)
+                st.session_state["comp_link_info_v2"] = info
+
+            info = st.session_state.get("comp_link_info_v2", None)
+            if info:
+                st.info("\n\n".join(info["tips"]))
+                comp_platform_hint = info.get("platform", "")
+
+                comp_name3 = st.text_input("竞对名称（可选）", value="Competitor A", key="comp_name_link")
+                comp_text2 = st.text_area("把你从平台复制出来的竞对菜单文本粘贴到这里", height=200, key="comp_link_paste_text")
+                if st.button("解析竞对菜单（链接→粘贴文本）", type="secondary", key="btn_parse_comp_link_paste"):
+                    with st.spinner("正在解析竞对菜单文本…"):
+                        meta = extract_menu_from_pasted_text(
+                            menu_text=comp_text2,
+                            api_key=openai_key,
+                            model=model,
+                            label=f"COMP_MENU_FROM_LINK::{comp_name3}",
+                            platform_hint=comp_platform_hint
+                        )
+                    st.session_state.setdefault("comp_menu_metas_v2", [])
+                    st.session_state["comp_menu_metas_v2"].append(meta)
+
+        comp_menu_metas = st.session_state.get("comp_menu_metas_v2", [])
+        if comp_menu_metas:
+            with st.expander(f"已导入竞对数量：{len(comp_menu_metas)}（预览）", expanded=False):
+                for i, meta in enumerate(comp_menu_metas[-5:], start=1):
+                    st.markdown(f"**#{i} {meta.get('label','')}**")
+                    dfc = menu_to_df(meta)
+                    st.dataframe(dfc.head(30), use_container_width=True, height=220)
+
+        if st.button("清空所有竞对导入", key="btn_clear_comp_v2"):
+            st.session_state["comp_menu_metas_v2"] = []
+            st.rerun()
+
+    st.divider()
+
+    st.markdown("## C. 生成：名字 / 描述 / 排序 / 套餐（先调价→再组套餐）")
+    st.caption("你会得到可直接上架的菜单结构（含堂食/外卖价分层与抽佣净到手估算），并可下载 CSV/JSON。")
+
+    run_disabled = (own_menu_meta is None) or (menu_to_df(own_menu_meta).empty)
+
+    if st.button("生成智能菜单结构（升级版）", type="primary", disabled=run_disabled, key="btn_opt_menu_v2"):
         progress = st.progress(0)
         status = st.empty()
 
@@ -1771,27 +2008,28 @@ with tab_menu:
             progress.progress(pct)
             status.info(msg)
 
-        step(10, "解析门店菜单…")
-        own_meta2 = extract_menu_with_openai(own_menu_files2 or [], openai_key, model, label="OWN_MENU_OPT")
+        step(10, "整理菜单数据…")
+        own_df = menu_to_df(own_menu_meta)
+        comp_dfs = []
+        comp_metas_final = []
+        for meta in (comp_menu_metas or []):
+            dfc = menu_to_df(meta)
+            if dfc is not None and not dfc.empty:
+                comp_dfs.append(dfc)
+                comp_metas_final.append(meta)
 
-        step(30, "解析竞对菜单…")
-        comp_meta2 = extract_menu_with_openai(comp_menu_files2 or [], openai_key, model, label="COMP_MENU_OPT")
+        step(35, "计算同行价带与偏高判断…")
+        market_summary = summarize_market_prices(own_df, comp_dfs)
 
-        own_df2 = menu_to_df(own_meta2)
-        comp_df2 = menu_to_df(comp_meta2)
-
-        step(55, "计算同行价带与偏高判断…")
-        market_summary = summarize_market_prices(own_df2, [comp_df2])
-
-        step(75, "AI 进行：调价 → 组套餐 → 分层定价 → 抽佣净到手估算…")
+        step(70, "AI：先调价→再组套餐→排序→分层定价→抽佣净到手测算…")
         try:
             optimized_df = generate_optimized_menu_df(
                 api_key=openai_key,
                 model=model,
                 restaurant_name=menu_rest_name,
                 address=menu_rest_addr,
-                own_menu_meta=own_meta2,
-                competitor_menu_metas=[comp_meta2],
+                own_menu_meta=own_menu_meta,
+                competitor_menu_metas=comp_metas_final if comp_metas_final else [],
                 market_summary=market_summary,
                 lang=menu_lang,
                 objective_mode=objective_mode,
@@ -1802,31 +2040,30 @@ with tab_menu:
             st.error(f"生成失败：{str(e)[:300]}")
             st.stop()
 
-        st.session_state["optimized_menu_df"] = optimized_df
-        st.session_state["optimized_market_summary"] = market_summary
-        st.session_state["optimized_raw_metas"] = {"own": own_meta2, "comp": comp_meta2}
-        st.session_state["optimized_settings"] = {
+        st.session_state["optimized_menu_df_v2"] = optimized_df
+        st.session_state["optimized_market_summary_v2"] = market_summary
+        st.session_state["optimized_settings_v2"] = {
             "objective_mode": objective_mode,
             "commission_rate": float(commission_rate),
             "price_layering": bool(price_layering),
             "lang": menu_lang,
+            "own_input_method": own_method,
+            "competitors_count": len(comp_metas_final),
         }
 
         step(100, "完成。")
-        status.success("已生成智能菜单结构（含：价格锚点/心理定价/同行对标/套餐/堂食外卖分层/抽佣净到手估算）。")
+        status.success("已生成智能菜单结构（升级版）。")
 
-    optimized_df = st.session_state.get("optimized_menu_df", None)
+    optimized_df = st.session_state.get("optimized_menu_df_v2", None)
     if isinstance(optimized_df, pd.DataFrame) and not optimized_df.empty:
         st.subheader("智能菜单预览（可直接下载）")
         st.dataframe(optimized_df, use_container_width=True, height=520)
 
-        settings = st.session_state.get("optimized_settings", {})
         with st.expander("本次策略参数（用于复盘/对齐）", expanded=False):
-            st.json(settings)
+            st.json(st.session_state.get("optimized_settings_v2", {}))
 
-        market_summary = st.session_state.get("optimized_market_summary", {})
         with st.expander("同行价带摘要（用于解释为什么要调价/怎么锚点）", expanded=False):
-            st.json(market_summary)
+            st.json(st.session_state.get("optimized_market_summary_v2", {}))
 
         c1, c2 = st.columns(2)
         with c1:
@@ -1844,4 +2081,4 @@ with tab_menu:
                 mime="application/json"
             )
     else:
-        st.info("上传门店菜单 + 竞对菜单，然后点击“生成智能菜单结构”。")
+        st.info("请先导入【你的菜单】（任一方式），然后点击生成。")
