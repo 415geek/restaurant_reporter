@@ -1829,9 +1829,17 @@ with tab_food:
                     with cols[idx % 2]:
                         st.caption(k)
                         if isinstance(v, (bytes, bytearray)) and len(v) > 50:
-                            st.image(v, use_container_width=True)
-                        else:
-                            st.warning(f"{k} 图表数据缺失，已跳过。")
+    try:
+        # Some Streamlit builds can be picky about raw PNG bytes; decode via PIL for safety.
+        from PIL import Image
+        import io as _io
+        img = Image.open(_io.BytesIO(v))
+        st.image(img, use_container_width=True)
+    except Exception as _e:
+        st.warning(f"{k} 图表预览失败（已跳过）：{str(_e)[:120]}")
+else:
+    st.warning(f"{k} 图表数据缺失，已跳过。")
+
                     idx += 1
             else:
                 st.info("暂无图表（通常是菜单价格识别不足导致）。")
